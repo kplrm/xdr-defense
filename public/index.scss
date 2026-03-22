@@ -10,15 +10,6 @@
   background: transparent;
 }
 
-.xdrDefense__headerStrip {
-  border: 1px solid #d6e2ea;
-  background: linear-gradient(135deg, #0f1720 0%, #143042 50%, #145d73 100%);
-}
-
-.xdrDefense__headerStrip .euiBadge {
-  box-shadow: none;
-}
-
 .xdrDefense__metricCard {
   min-height: 100%;
   border: 1px solid #d6e2ea;
@@ -57,4 +48,24 @@
   text-overflow: ellipsis;
   white-space: nowrap;
   vertical-align: bottom;
+}
+
+.xdrDefense__artifactDetailsItem {
+  min-width: 340px;
+  max-width: min(420px, 100%);
+  flex: 1 1 340px;
+}
+
+.xdrDefense__artifactDetailsPanel {
+  width: 100%;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+@media (max-width: 992px) {
+  .xdrDefense__artifactDetailsItem {
+    min-width: 100%;
+    max-width: 100%;
+    flex-basis: 100%;
+  }
 }

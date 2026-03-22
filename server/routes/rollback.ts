@@ -1,17 +1,21 @@
 import { schema } from '@osd/config-schema';
 
-import { getPolicy, listArtifacts, listThreatFeeds } from '../lib/store';
+import { getEffectivePolicy, listArtifacts, listThreatFeeds } from '../lib/store';
 
 export function registerRollbackRoutes(router: any) {
   router.get(
     {
       path: '/api/xdr-defense/summary',
-      validate: false,
+      validate: {
+        query: schema.object({
+          policy_id: schema.maybe(schema.string()),
+        }),
+      },
     },
-    async (_ctx: unknown, _req: unknown, res: any) => {
+    async (_ctx: unknown, req: any, res: any) => {
       const [policy, artifacts, feeds] = await Promise.all([
-        getPolicy(),
-        listArtifacts(),
+        getEffectivePolicy(req.query.policy_id),
+        listArtifacts(req.query.policy_id),
         listThreatFeeds(),
       ]);
       return res.ok({

@@ -1,0 +1,16 @@
+{
+  "name": "opensearch_xdr_defense",
+  "version": "0.1.0",
+  "license": "AGPL-3.0-only",
+  "private": true,
+  "description": "OpenSearch Dashboards plugin for detection/prevention management",
+  "scripts": {
+    "version:sync": "node ./scripts/sync_version.js",
+    "prebuild": "yarn version:sync",
+    "build": "yarn plugin-helpers build",
+    "lint": "node ../../node_modules/typescript/bin/tsc -p tsconfig.json --noEmit",
+    "plugin-helpers": "node ../../scripts/plugin_helpers",
+    "osd": "node ../../scripts/osd"
+  },
+  "devDependencies": {}
+}

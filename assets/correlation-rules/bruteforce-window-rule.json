@@ -1,0 +1,43 @@
+{
+  "name": "xdr-bruteforce-window",
+  "type": "query",
+  "schedule": { "interval": { "period": 1, "unit": "MINUTES" } },
+  "inputs": [
+    {
+      "search": {
+        "indices": ["xdr-alerts-*"],
+        "query": {
+          "size": 0,
+          "query": {
+            "bool": {
+              "filter": [
+                { "range": { "@timestamp": { "gte": "now-5m" } } },
+                { "term": { "rule.id": "credential.bruteforce.failed_logins" } }
+              ]
+            }
+          },
+          "aggs": {
+            "by_host": {
+              "terms": { "field": "host.hostname", "size": 100 },
+              "aggs": {
+                "hits": { "value_count": { "field": "@timestamp" } }
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "triggers": [
+    {
+      "name": "bruteforce-threshold",
+      "severity": "2",
+      "condition": {
+        "script": {
+          "source": "return true;"
+        }
+      },
+      "actions": []
+    }
+  ]
+}

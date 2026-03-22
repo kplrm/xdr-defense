@@ -1,0 +1,17 @@
+{
+  "description": "Normalize xdr alert fields and add ingest metadata",
+  "processors": [
+    {
+      "set": {
+        "field": "event.dataset",
+        "value": "xdr.alerts"
+      }
+    },
+    {
+      "set": {
+        "field": "labels.ingested_by",
+        "value": "xdr-defense"
+      }
+    }
+  ]
+}

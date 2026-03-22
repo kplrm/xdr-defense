@@ -1,0 +1,16 @@
+{
+  "extends": "../../tsconfig.json",
+  "include": [
+    "index.ts",
+    "public/**/*.ts",
+    "public/**/*.tsx",
+    "server/**/*.ts",
+    "../../typings/**/*"
+  ],
+  "exclude": ["node_modules", "*/node_modules/"],
+  "compilerOptions": {
+    "outDir": "./target",
+    "skipLibCheck": true,
+    "esModuleInterop": true
+  }
+}

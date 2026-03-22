@@ -1,0 +1,26 @@
+{
+  "index_patterns": ["xdr-prevention-actions-*"],
+  "template": {
+    "settings": {
+      "number_of_shards": 1
+    },
+    "mappings": {
+      "dynamic": true,
+      "properties": {
+        "@timestamp": { "type": "date" },
+        "event.type": { "type": "keyword" },
+        "event.module": { "type": "keyword" },
+        "action": { "type": "keyword" },
+        "source_rule_id": { "type": "keyword" },
+        "source_module": { "type": "keyword" },
+        "agent.id": { "type": "keyword" },
+        "host.hostname": { "type": "keyword" }
+      }
+    }
+  },
+  "priority": 500,
+  "version": 1,
+  "_meta": {
+    "owner": "xdr-defense"
+  }
+}

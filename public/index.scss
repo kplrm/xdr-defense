@@ -1,0 +1,60 @@
+.xdrDefense {
+  background:
+    radial-gradient(circle at top right, rgba(0, 179, 164, 0.08), transparent 28%),
+    radial-gradient(circle at left center, rgba(0, 102, 255, 0.06), transparent 22%),
+    linear-gradient(180deg, #f7fafc 0%, #eef3f7 100%);
+  min-height: 100%;
+}
+
+.xdrDefense .euiPageTemplate {
+  background: transparent;
+}
+
+.xdrDefense__headerStrip {
+  border: 1px solid #d6e2ea;
+  background: linear-gradient(135deg, #0f1720 0%, #143042 50%, #145d73 100%);
+}
+
+.xdrDefense__headerStrip .euiBadge {
+  box-shadow: none;
+}
+
+.xdrDefense__metricCard {
+  min-height: 100%;
+  border: 1px solid #d6e2ea;
+  box-shadow: 0 18px 40px rgba(15, 23, 32, 0.08);
+}
+
+.xdrDefense__heroPanel {
+  border: 1px solid #d6e2ea;
+  background:
+    linear-gradient(135deg, rgba(20, 93, 115, 0.08), rgba(255, 255, 255, 0.92)),
+    #ffffff;
+  box-shadow: 0 18px 40px rgba(15, 23, 32, 0.08);
+}
+
+.xdrDefense__sidePanel {
+  border: 1px solid #d6e2ea;
+  background: #ffffff;
+  box-shadow: 0 18px 40px rgba(15, 23, 32, 0.08);
+}
+
+.xdrDefense__groupPanel {
+  margin-bottom: 12px;
+  border: 1px solid #dbe5ec;
+  background: linear-gradient(180deg, #ffffff 0%, #f8fbfd 100%);
+}
+
+.xdrDefense__ruleCard {
+  margin-bottom: 8px;
+  border-left: 4px solid #0073e6;
+}
+
+.xdrDefense__truncate {
+  display: inline-block;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: bottom;
+}

@@ -1,0 +1,25 @@
+{
+  "description": "Normalize xdr agent logs",
+  "processors": [
+    {
+      "set": {
+        "field": "event.dataset",
+        "value": "xdr.agent_logs"
+      }
+    },
+    {
+      "rename": {
+        "field": "payload.log.level",
+        "target_field": "log.level",
+        "ignore_missing": true
+      }
+    },
+    {
+      "rename": {
+        "field": "payload.message",
+        "target_field": "message",
+        "ignore_missing": true
+      }
+    }
+  ]
+}

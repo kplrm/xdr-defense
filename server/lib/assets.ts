@@ -74,6 +74,100 @@ const INDEX_TEMPLATES = [
       _meta: { owner: 'xdr-defense' },
     },
   },
+  {
+    name: 'xdr-yara-rollout-status-template',
+    body: {
+      index_patterns: ['xdr-yara-rollout-status-*'],
+      template: {
+        settings: { number_of_shards: 1 },
+        mappings: {
+          dynamic: true,
+          properties: {
+            '@timestamp': { type: 'date' },
+            event: {
+              properties: {
+                kind: { type: 'keyword' },
+                category: { type: 'keyword' },
+                type: { type: 'keyword' },
+                module: { type: 'keyword' },
+              },
+            },
+            agent: {
+              properties: {
+                id: { type: 'keyword' },
+              },
+            },
+            host: {
+              properties: {
+                hostname: { type: 'keyword' },
+              },
+            },
+            xdr: {
+              properties: {
+                manager_policy_id: { type: 'keyword' },
+                agent_id: { type: 'keyword' },
+                state: { type: 'keyword' },
+                total_rules: { type: 'integer' },
+                loaded_rules: { type: 'integer' },
+                failed_rules_count: { type: 'integer' },
+                reported_at: { type: 'long' },
+                failed_rules: {
+                  type: 'object',
+                  dynamic: true,
+                },
+              },
+            },
+          },
+        },
+      },
+      priority: 500,
+      version: 1,
+      _meta: { owner: 'xdr-defense' },
+    },
+  },
+  {
+    name: 'xdr-yara-rule-inventory-template',
+    body: {
+      index_patterns: ['xdr-yara-rule-inventory-*'],
+      template: {
+        settings: { number_of_shards: 1 },
+        mappings: {
+          dynamic: true,
+          properties: {
+            '@timestamp': { type: 'date' },
+            event: {
+              properties: {
+                kind: { type: 'keyword' },
+                category: { type: 'keyword' },
+                type: { type: 'keyword' },
+                module: { type: 'keyword' },
+              },
+            },
+            agent: {
+              properties: {
+                id: { type: 'keyword' },
+              },
+            },
+            xdr: {
+              properties: {
+                agent_id: { type: 'keyword' },
+                loaded_rule_count: { type: 'integer' },
+                failed_rules_count: { type: 'integer' },
+                checked_at: { type: 'long' },
+                failed_rules: {
+                  type: 'object',
+                  dynamic: true,
+                },
+              },
+            },
+          },
+        },
+      },
+      priority: 500,
+      version: 1,
+      _meta: { owner: 'xdr-defense' },
+    },
+  },
 ];
 
 const INGEST_PIPELINES = [

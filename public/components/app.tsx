@@ -24,6 +24,7 @@ import {
   EuiHealth,
   EuiHorizontalRule,
   EuiLink,
+  EuiLoadingSpinner,
   EuiPageTemplate,
   EuiPanel,
   EuiSpacer,
@@ -215,11 +216,11 @@ interface YaraRolloutAgentStatus {
   acked_at?: string;
   failure_reason?: string;
   retry_requested_at?: string;
+  retry_in_progress?: boolean;
 }
 
 interface YaraRolloutSummaryResponse {
   manager_policy_id: string;
-  rollout_version: number;
   action: YaraRolloutAction;
   artifact_ids: string[];
   updated_at: string;
@@ -237,7 +238,7 @@ interface YaraRolloutFailureRow {
   agentID: string;
   agentName: string;
   action: YaraRolloutAction;
-  failureType: 'ack_failed' | 'stale_pending';
+  failureType: 'ack_failed' | 'stale_pending' | 'retry_in_progress';
   details: string;
   lastAttemptedAt: string;
 }
@@ -246,6 +247,15 @@ interface XdrDefenseAppDeps {
   basename: string;
   notifications: CoreStart['notifications'];
   http: CoreStart['http'];
+}
+
+interface YaraRetryResponse extends YaraRolloutSummaryResponse {
+  forge_sync?: {
+    started: boolean;
+    startedAt?: string;
+    pid?: number;
+    message?: string;
+  };
 }
 
 const capabilityGroups = [
@@ -324,6 +334,49 @@ const prettyDate = (value?: string) => {
   return new Date(parsed).toLocaleString();
 };
 
+const sameForgeSyncStatus = (
+  current: YaraForgeSyncStatusResponse | null,
+  next: YaraForgeSyncStatusResponse | null
+) => {
+  if (!current && !next) {
+    return true;
+  }
+  if (!current || !next) {
+    return false;
+  }
+  return (
+    current.status === next.status &&
+    current.sync_id === next.sync_id &&
+    current.started_at === next.started_at &&
+    current.completed_at === next.completed_at &&
+    current.processed_rules === next.processed_rules &&
+    current.total_rules === next.total_rules &&
+    current.error === next.error
+  );
+};
+
+const sameYaraRolloutSummary = (
+  current: YaraRolloutSummaryResponse | null,
+  next: YaraRolloutSummaryResponse | null
+) => {
+  if (!current && !next) {
+    return true;
+  }
+  if (!current || !next) {
+    return false;
+  }
+  return (
+    current.manager_policy_id === next.manager_policy_id &&
+    current.updated_at === next.updated_at &&
+    current.target_agent_ids.length === next.target_agent_ids.length &&
+    current.pending_agent_ids.length === next.pending_agent_ids.length &&
+    current.acked_agent_ids.length === next.acked_agent_ids.length &&
+    current.failed_agent_ids.length === next.failed_agent_ids.length &&
+    current.stale_pending_agent_ids.length === next.stale_pending_agent_ids.length &&
+    current.agents.length === next.agents.length
+  );
+};
+
 const isSettledFulfilled = <T,>(result: PromiseSettledResult<T>): result is PromiseFulfilledResult<T> =>
   result.status === 'fulfilled';
 
@@ -342,6 +395,8 @@ export const XdrDefenseApp = ({ http, notifications }: XdrDefenseAppDeps) => {
   const [isSyncingYaraForge, setIsSyncingYaraForge] = useState(false);
   const [isConfirmingRollback, setIsConfirmingRollback] = useState(false);
   const [selectedArtifactID, setSelectedArtifactID] = useState<string | null>(null);
+  const [isArtifactDetailsFlyoutOpen, setIsArtifactDetailsFlyoutOpen] = useState(false);
+  const [artifactNameSearch, setArtifactNameSearch] = useState('');
   const [selectedArtifactIDs, setSelectedArtifactIDs] = useState<string[]>([]);
   const [artifactPageIndex, setArtifactPageIndex] = useState(0);
   const [artifactPageSize, setArtifactPageSize] = useState(20);
@@ -350,7 +405,6 @@ export const XdrDefenseApp = ({ http, notifications }: XdrDefenseAppDeps) => {
   const [isCustomContentDrawerOpen, setIsCustomContentDrawerOpen] = useState(false);
   const [latestYaraRollout, setLatestYaraRollout] = useState<YaraRolloutSummaryResponse | null>(null);
   const [isRetryingYaraRollout, setIsRetryingYaraRollout] = useState(false);
-
   const [mode, setMode] = useState<PolicyMode>('detect');
   const [capabilities, setCapabilities] = useState<Record<string, boolean>>({ ...defaultCapabilities });
   const [managerPolicies, setManagerPolicies] = useState<ManagerPolicy[]>([]);
@@ -381,6 +435,8 @@ export const XdrDefenseApp = ({ http, notifications }: XdrDefenseAppDeps) => {
   const lastSeenForgeSyncIDRef = useRef<string | null>(null);
   const lastHandledForgeTerminalStatusRef = useRef<string | null>(null);
   const pendingYaraSyncTargetsRef = useRef<string[]>([]);
+  const lastArtifactsRefreshAtRef = useRef(0);
+  const lastYaraRolloutPollAtRef = useRef(0);
 
   const api = async <T,>(
     path: string,
@@ -602,7 +658,7 @@ export const XdrDefenseApp = ({ http, notifications }: XdrDefenseAppDeps) => {
           query: { stale_after_seconds: 900 },
         }
       );
-      setLatestYaraRollout(rollout);
+      setLatestYaraRollout((current) => (sameYaraRolloutSummary(current, rollout) ? current : rollout));
       return rollout;
     } catch (error) {
       setLatestYaraRollout(null);
@@ -1038,7 +1094,7 @@ export const XdrDefenseApp = ({ http, notifications }: XdrDefenseAppDeps) => {
           return;
         }
 
-        setYaraForgeSyncStatus(status);
+        setYaraForgeSyncStatus((current) => (sameForgeSyncStatus(current, status) ? current : status));
         const statusValue = status.status ?? 'idle';
         const isActive = ['downloading', 'extracting', 'processing'].includes(statusValue);
         setIsSyncingYaraForge(isActive);
@@ -1052,13 +1108,19 @@ export const XdrDefenseApp = ({ http, notifications }: XdrDefenseAppDeps) => {
         const processedRules = status.processed_rules ?? 0;
         if (processedRules > lastSeenForgeProcessedRef.current) {
           lastSeenForgeProcessedRef.current = processedRules;
-          await refreshArtifactsAndManifest(selectedManagerPolicyID || 'default');
+          const nowMs = Date.now();
+          // Throttle expensive artifact refreshes while forge is importing.
+          if (nowMs-lastArtifactsRefreshAtRef.current >= 5000) {
+            lastArtifactsRefreshAtRef.current = nowMs;
+            await refreshArtifactsAndManifest(selectedManagerPolicyID || 'default');
+          }
         }
 
         const terminalStatusKey = `${status.sync_id ?? 'none'}:${statusValue}`;
 
         if (statusValue === 'completed' && lastHandledForgeTerminalStatusRef.current !== terminalStatusKey) {
           lastHandledForgeTerminalStatusRef.current = terminalStatusKey;
+          lastArtifactsRefreshAtRef.current = Date.now();
           await refreshArtifactsAndManifest(selectedManagerPolicyID || 'default');
           await reconcileYaraRollout(
             'sync',
@@ -1077,7 +1139,11 @@ export const XdrDefenseApp = ({ http, notifications }: XdrDefenseAppDeps) => {
           setIsSyncingYaraForge(false);
         }
 
-        await loadLatestYaraRollout(selectedManagerPolicyID || 'default');
+        const nowMs = Date.now();
+        if (isActive || nowMs-lastYaraRolloutPollAtRef.current >= 5000) {
+          lastYaraRolloutPollAtRef.current = nowMs;
+          await loadLatestYaraRollout(selectedManagerPolicyID || 'default');
+        }
       } catch (error) {
         if (!isCancelled) {
           toastWarning('Unable to load YARA Forge sync status', error);
@@ -1088,7 +1154,7 @@ export const XdrDefenseApp = ({ http, notifications }: XdrDefenseAppDeps) => {
     void pollSyncStatus();
     const intervalID = window.setInterval(() => {
       void pollSyncStatus();
-    }, 1000);
+    }, 2500);
 
     return () => {
       isCancelled = true;
@@ -1188,7 +1254,7 @@ export const XdrDefenseApp = ({ http, notifications }: XdrDefenseAppDeps) => {
     setIsRetryingYaraRollout(true);
     try {
       const encodedPolicyID = encodeURIComponent(selectedManagerPolicyID || 'default');
-      const rollout = await api<YaraRolloutSummaryResponse>(
+      const rollout = await api<YaraRetryResponse>(
         `/api/xdr-defense/yara-rollouts/${encodedPolicyID}/retry`,
         {
           method: 'POST',
@@ -1196,7 +1262,11 @@ export const XdrDefenseApp = ({ http, notifications }: XdrDefenseAppDeps) => {
         }
       );
       setLatestYaraRollout(rollout);
-      notifications.toasts.addSuccess('Retry requested for YARA rollout failures');
+      if (rollout.forge_sync?.started) {
+        notifications.toasts.addSuccess('Retry requested and YARA Forge sync started');
+      } else {
+        notifications.toasts.addSuccess('Retry requested for YARA rollout failures');
+      }
     } catch (error) {
       toastError('Unable to retry YARA rollout failures', error);
     } finally {
@@ -1274,9 +1344,32 @@ export const XdrDefenseApp = ({ http, notifications }: XdrDefenseAppDeps) => {
     return [];
   }, [selectedArtifact]);
 
+  const filteredArtifacts = useMemo(() => {
+    const query = artifactNameSearch.trim().toLowerCase();
+    if (!query) {
+      return artifacts;
+    }
+    return artifacts.filter((artifact) => artifact.id.toLowerCase().includes(query));
+  }, [artifacts, artifactNameSearch]);
+
   const artifactColumns = useMemo(
     (): EuiBasicTableColumn<ArtifactEntry>[] => [
-      { field: 'id', name: 'Artifact' },
+      {
+        field: 'id',
+        name: 'Artifact',
+        render: (value: string) => (
+          <EuiLink
+            href="#"
+            onClick={(event) => {
+              event.preventDefault();
+              setSelectedArtifactID(value);
+              setIsArtifactDetailsFlyoutOpen(true);
+            }}
+          >
+            {value}
+          </EuiLink>
+        ),
+      },
       { field: 'type', name: 'Type' },
       {
         field: 'enabled',
@@ -1310,8 +1403,13 @@ export const XdrDefenseApp = ({ http, notifications }: XdrDefenseAppDeps) => {
 
   const pagedArtifacts = useMemo(() => {
     const start = artifactPageIndex * artifactPageSize;
-    return artifacts.slice(start, start + artifactPageSize);
-  }, [artifacts, artifactPageIndex, artifactPageSize]);
+    return filteredArtifacts.slice(start, start + artifactPageSize);
+  }, [filteredArtifacts, artifactPageIndex, artifactPageSize]);
+
+  useEffect(() => {
+    const lastPageIndex = Math.max(0, Math.ceil(filteredArtifacts.length / artifactPageSize) - 1);
+    setArtifactPageIndex((current) => (current > lastPageIndex ? lastPageIndex : current));
+  }, [filteredArtifacts.length, artifactPageSize]);
 
   const artifactSelection = useMemo(() => {
     const pageArtifactIDs = new Set(pagedArtifacts.map((artifact) => artifact.id));
@@ -1346,9 +1444,9 @@ export const XdrDefenseApp = ({ http, notifications }: XdrDefenseAppDeps) => {
       pageIndex: artifactPageIndex,
       pageSize: artifactPageSize,
       pageSizeOptions: [20, 50, 100, 500],
-      totalItemCount: artifacts.length,
+      totalItemCount: filteredArtifacts.length,
     }),
-    [artifactPageIndex, artifactPageSize, artifacts.length]
+    [artifactPageIndex, artifactPageSize, filteredArtifacts.length]
   );
 
   const onArtifactTableChange = ({ page }: CriteriaWithPagination<ArtifactEntry>) => {
@@ -1455,17 +1553,24 @@ export const XdrDefenseApp = ({ http, notifications }: XdrDefenseAppDeps) => {
     const staleSet = new Set(latestYaraRollout.stale_pending_agent_ids);
 
     return latestYaraRollout.agents
-      .filter((agent) => agent.state === 'failed' || staleSet.has(agent.agent_id))
+      .filter((agent) => agent.state === 'failed' || staleSet.has(agent.agent_id) || agent.retry_in_progress)
       .map((agent) => {
         const managerAgent = managerAgentByID[agent.agent_id];
         const stalePending = staleSet.has(agent.agent_id);
+        const retryInProgress = Boolean(agent.retry_in_progress);
         return {
           id: `${agent.agent_id}:${agent.last_action}`,
           agentID: agent.agent_id,
           agentName: managerAgent?.name || agent.hostname || 'unknown',
           action: agent.last_action,
-          failureType: stalePending ? ('stale_pending' as const) : ('ack_failed' as const),
-          details: stalePending
+          failureType: retryInProgress
+            ? ('retry_in_progress' as const)
+            : stalePending
+            ? ('stale_pending' as const)
+            : ('ack_failed' as const),
+          details: retryInProgress
+            ? 'Retry requested. Waiting for agent rollout ACK...'
+            : stalePending
             ? `No ack past ${latestYaraRollout.stale_after_seconds}s (offline/no-ack).`
             : agent.failure_reason || 'Agent reported failure while applying action.',
           lastAttemptedAt: prettyDate(agent.retry_requested_at || agent.last_attempted_at),
@@ -1487,8 +1592,12 @@ export const XdrDefenseApp = ({ http, notifications }: XdrDefenseAppDeps) => {
         field: 'failureType',
         name: 'Failure',
         render: (value: YaraRolloutFailureRow['failureType']) => (
-          <EuiBadge color={value === 'stale_pending' ? 'warning' : 'danger'}>
-            {value === 'stale_pending' ? 'offline/no-ack stale pending' : 'ack failed'}
+          <EuiBadge color={value === 'retry_in_progress' ? 'accent' : value === 'stale_pending' ? 'warning' : 'danger'}>
+            {value === 'retry_in_progress'
+              ? '⏳ retrying'
+              : value === 'stale_pending'
+              ? 'offline/no-ack stale pending'
+              : 'ack failed'}
           </EuiBadge>
         ),
       },
@@ -1845,183 +1954,261 @@ export const XdrDefenseApp = ({ http, notifications }: XdrDefenseAppDeps) => {
             </>
           )}
 
-          <EuiFlexGroup gutterSize="l" alignItems="flexStart">
-            <EuiFlexItem grow={2} style={{ minWidth: 0 }}>
-              <EuiFlexGroup alignItems="center" justifyContent="spaceBetween" gutterSize="s" responsive={false}>
+          <EuiFlexGroup alignItems="center" justifyContent="spaceBetween" gutterSize="s" responsive={false}>
+            <EuiFlexItem grow={false}>
+              <EuiText size="s" color="subdued">
+                <p>{selectedArtifactIDs.length} selected</p>
+              </EuiText>
+            </EuiFlexItem>
+            <EuiFlexItem grow={false}>
+              <EuiFlexGroup gutterSize="s" responsive={false} alignItems="center">
                 <EuiFlexItem grow={false}>
-                  <EuiText size="s" color="subdued">
-                    <p>{selectedArtifactIDs.length} selected</p>
-                  </EuiText>
+                  <EuiButton
+                    size="s"
+                    onClick={() => updateSelectedArtifactsState(true)}
+                    isDisabled={selectedArtifactIDs.length === 0 || bulkArtifactOperation !== null}
+                    isLoading={bulkArtifactOperation === 'activate'}
+                  >
+                    Activate
+                  </EuiButton>
                 </EuiFlexItem>
                 <EuiFlexItem grow={false}>
-                  <EuiFlexGroup gutterSize="s" responsive={false} alignItems="center">
-                    <EuiFlexItem grow={false}>
-                      <EuiButton
-                        size="s"
-                        onClick={() => updateSelectedArtifactsState(true)}
-                        isDisabled={selectedArtifactIDs.length === 0 || bulkArtifactOperation !== null}
-                        isLoading={bulkArtifactOperation === 'activate'}
-                      >
-                        Activate
-                      </EuiButton>
-                    </EuiFlexItem>
-                    <EuiFlexItem grow={false}>
-                      <EuiButton
-                        size="s"
-                        onClick={() => updateSelectedArtifactsState(false)}
-                        isDisabled={selectedArtifactIDs.length === 0 || bulkArtifactOperation !== null}
-                        isLoading={bulkArtifactOperation === 'deactivate'}
-                      >
-                        Deactivate
-                      </EuiButton>
-                    </EuiFlexItem>
-                    <EuiFlexItem grow={false}>
-                      <EuiButton
-                        size="s"
-                        color="danger"
-                        onClick={deleteSelectedArtifacts}
-                        isDisabled={selectedArtifactIDs.length === 0 || bulkArtifactOperation !== null}
-                        isLoading={bulkArtifactOperation === 'delete'}
-                      >
-                        Delete
-                      </EuiButton>
-                    </EuiFlexItem>
-                  </EuiFlexGroup>
+                  <EuiButton
+                    size="s"
+                    onClick={() => updateSelectedArtifactsState(false)}
+                    isDisabled={selectedArtifactIDs.length === 0 || bulkArtifactOperation !== null}
+                    isLoading={bulkArtifactOperation === 'deactivate'}
+                  >
+                    Deactivate
+                  </EuiButton>
+                </EuiFlexItem>
+                <EuiFlexItem grow={false}>
+                  <EuiButton
+                    size="s"
+                    color="danger"
+                    onClick={deleteSelectedArtifacts}
+                    isDisabled={selectedArtifactIDs.length === 0 || bulkArtifactOperation !== null}
+                    isLoading={bulkArtifactOperation === 'delete'}
+                  >
+                    Delete
+                  </EuiButton>
                 </EuiFlexItem>
               </EuiFlexGroup>
-
-              <EuiSpacer size="s" />
-
-              <div style={{ overflowX: 'auto', width: '100%', paddingBottom: 4 }}>
-                <div style={{ minWidth: 860 }}>
-                  <EuiBasicTable
-                    itemId="id"
-                    items={pagedArtifacts}
-                    columns={artifactColumns}
-                    selection={artifactSelection}
-                    pagination={artifactPagination}
-                    onChange={onArtifactTableChange}
-                    rowProps={(artifact) => ({
-                      onClick: () => setSelectedArtifactID(artifact.id),
-                      style: { cursor: 'pointer' },
-                      'aria-selected': selectedArtifactID === artifact.id,
-                    })}
-                  />
-                </div>
-              </div>
-            </EuiFlexItem>
-
-            <EuiFlexItem grow={false} className="xdrDefense__artifactDetailsItem">
-              <EuiPanel color="subdued" paddingSize="m" className="xdrDefense__artifactDetailsPanel">
-                <EuiTitle size="xs">
-                  <h4>Selected artifact details</h4>
-                </EuiTitle>
-                <EuiSpacer size="s" />
-                {!selectedArtifact ? (
-                  <EuiText size="s" color="subdued">
-                    <p>Select an artifact row to inspect metadata and embedded rule details.</p>
-                  </EuiText>
-                ) : (
-                  <>
-                    <EuiText size="s">
-                      <p>
-                        <strong>Artifact ID:</strong> {selectedArtifact.id}
-                      </p>
-                      <p>
-                        <strong>Type:</strong> {selectedArtifact.type}
-                      </p>
-                      <p>
-                        <strong>State:</strong> {selectedArtifact.enabled ? 'active' : 'inactive'}
-                      </p>
-                      <p>
-                        <strong>Version:</strong> {selectedArtifact.version}
-                      </p>
-                      <p>
-                        <strong>Checksum:</strong> {selectedArtifact.checksum}
-                      </p>
-                      <p>
-                        <strong>Description:</strong> {selectedArtifact.description || 'n/a'}
-                      </p>
-                      <p>
-                        <strong>Source URL:</strong>{' '}
-                        {selectedArtifact.sourceUrl ? (
-                          <EuiLink href={selectedArtifact.sourceUrl} target="_blank" external>
-                            {selectedArtifact.sourceUrl}
-                          </EuiLink>
-                        ) : (
-                          'n/a'
-                        )}
-                      </p>
-                    </EuiText>
-
-                    {selectedArtifact.type === 'yara' && (
-                      <>
-                        <EuiSpacer size="s" />
-                        <EuiTitle size="xxs">
-                          <h5>Embedded YARA rule names</h5>
-                        </EuiTitle>
-                        <EuiSpacer size="xs" />
-                        {selectedArtifactYaraRuleNames && selectedArtifactYaraRuleNames.length > 0 ? (
-                          <EuiText size="s">
-                            <ul>
-                              {selectedArtifactYaraRuleNames.map((ruleName) => (
-                                <li key={ruleName}>{ruleName}</li>
-                              ))}
-                            </ul>
-                          </EuiText>
-                        ) : (
-                          <EuiText size="s" color="subdued">
-                            <p>No embedded rule catalog available for this artifact yet.</p>
-                          </EuiText>
-                        )}
-                      </>
-                    )}
-                  </>
-                )}
-              </EuiPanel>
             </EuiFlexItem>
           </EuiFlexGroup>
+
+          <EuiSpacer size="s" />
+
+          <EuiFlexGroup alignItems="center" gutterSize="s" responsive={false}>
+            <EuiFlexItem grow={false} style={{ minWidth: 340 }}>
+              <EuiCompressedFieldText
+                placeholder="Search artifact names"
+                value={artifactNameSearch}
+                onChange={(event) => {
+                  setArtifactNameSearch(event.target.value);
+                  setArtifactPageIndex(0);
+                }}
+                aria-label="Search artifact names"
+              />
+            </EuiFlexItem>
+            <EuiFlexItem grow={false}>
+              <EuiText size="xs" color="subdued">
+                <p>
+                  Showing {filteredArtifacts.length} of {artifacts.length} artifacts
+                </p>
+              </EuiText>
+            </EuiFlexItem>
+          </EuiFlexGroup>
+
+          <EuiSpacer size="s" />
+
+          <div style={{ overflowX: 'auto', width: '100%', paddingBottom: 4 }}>
+            <div style={{ minWidth: 860, maxHeight: 840, overflowY: 'auto' }}>
+              <EuiBasicTable
+                itemId="id"
+                items={pagedArtifacts}
+                columns={artifactColumns}
+                selection={artifactSelection}
+                pagination={artifactPagination}
+                onChange={onArtifactTableChange}
+              />
+            </div>
+          </div>
         </EuiPanel>
+
+        {isArtifactDetailsFlyoutOpen && selectedArtifact && (
+          <EuiFlyout onClose={() => setIsArtifactDetailsFlyoutOpen(false)} size="m" ownFocus>
+            <EuiFlyoutHeader hasBorder>
+              <EuiTitle size="s">
+                <h3>Artifact details</h3>
+              </EuiTitle>
+              <EuiSpacer size="s" />
+              <EuiText size="s" color="subdued">
+                <p>{selectedArtifact.id}</p>
+              </EuiText>
+            </EuiFlyoutHeader>
+            <EuiFlyoutBody>
+              <EuiText size="s">
+                <p>
+                  <strong>Artifact ID:</strong> {selectedArtifact.id}
+                </p>
+                <p>
+                  <strong>Type:</strong> {selectedArtifact.type}
+                </p>
+                <p>
+                  <strong>State:</strong> {selectedArtifact.enabled ? 'active' : 'inactive'}
+                </p>
+                <p>
+                  <strong>Version:</strong> {selectedArtifact.version}
+                </p>
+                <p>
+                  <strong>Checksum:</strong> {selectedArtifact.checksum}
+                </p>
+                <p>
+                  <strong>Description:</strong> {selectedArtifact.description || 'n/a'}
+                </p>
+                <p>
+                  <strong>Source URL:</strong>{' '}
+                  {selectedArtifact.sourceUrl ? (
+                    <EuiLink href={selectedArtifact.sourceUrl} target="_blank" external>
+                      {selectedArtifact.sourceUrl}
+                    </EuiLink>
+                  ) : (
+                    'n/a'
+                  )}
+                </p>
+              </EuiText>
+
+              {selectedArtifact.type === 'yara' && (
+                <>
+                  <EuiSpacer size="m" />
+                  <EuiTitle size="xs">
+                    <h4>Embedded YARA rule names</h4>
+                  </EuiTitle>
+                  <EuiSpacer size="s" />
+                  {selectedArtifactYaraRuleNames && selectedArtifactYaraRuleNames.length > 0 ? (
+                    <EuiText size="s">
+                      <ul>
+                        {selectedArtifactYaraRuleNames.map((ruleName) => (
+                          <li key={ruleName}>{ruleName}</li>
+                        ))}
+                      </ul>
+                    </EuiText>
+                  ) : (
+                    <EuiText size="s" color="subdued">
+                      <p>No embedded rule catalog available for this artifact yet.</p>
+                    </EuiText>
+                  )}
+                </>
+              )}
+            </EuiFlyoutBody>
+            <EuiFlyoutFooter>
+              <EuiButton onClick={() => setIsArtifactDetailsFlyoutOpen(false)} fill>
+                Close
+              </EuiButton>
+            </EuiFlyoutFooter>
+          </EuiFlyout>
+        )}
 
         <EuiSpacer size="l" />
 
         <EuiPanel paddingSize="l">
-          <EuiTitle size="xs">
-            <h4>YARA rollout failures</h4>
-          </EuiTitle>
-          <EuiSpacer size="s" />
-          <EuiFlexGroup gutterSize="s" alignItems="center" responsive={false}>
+          <EuiFlexGroup alignItems="center" justifyContent="spaceBetween" responsive={false}>
             <EuiFlexItem grow={false}>
-              <EuiBadge color={yaraRolloutFailureRows.length > 0 ? 'warning' : 'secondary'}>
-                failures {yaraRolloutFailureRows.length}
-              </EuiBadge>
+              <EuiTitle size="xs">
+                <h4>YARA rollout progress</h4>
+              </EuiTitle>
             </EuiFlexItem>
             <EuiFlexItem grow={false}>
-              <EuiBadge color="hollow">
-                rollout v{latestYaraRollout?.rollout_version ?? 0}
-              </EuiBadge>
-            </EuiFlexItem>
-            <EuiFlexItem grow={false}>
-              <EuiButton
-                size="s"
-                onClick={retryYaraRolloutFailures}
-                isLoading={isRetryingYaraRollout}
-                isDisabled={yaraRolloutFailureRows.length === 0}
-              >
-                Retry all failures
-              </EuiButton>
+              <EuiFlexGroup gutterSize="s" alignItems="center" responsive={false}>
+                <EuiFlexItem grow={false}>
+                  <EuiBadge color="secondary">
+                    acked {latestYaraRollout?.acked_agent_ids.length ?? 0} / {latestYaraRollout?.target_agent_ids.length ?? 0}
+                  </EuiBadge>
+                </EuiFlexItem>
+                <EuiFlexItem grow={false}>
+                  <EuiFlexGroup gutterSize="xs" alignItems="center" responsive={false}>
+                    {(() => {
+                      const pending = latestYaraRollout?.pending_agent_ids.length ?? 0;
+                      const stale = latestYaraRollout?.stale_pending_agent_ids.length ?? 0;
+                      const activeSyncing = pending - stale;
+                      if (activeSyncing > 0) {
+                        return (
+                          <>
+                            <EuiFlexItem grow={false}>
+                              <EuiLoadingSpinner size="s" />
+                            </EuiFlexItem>
+                            <EuiFlexItem grow={false}>
+                              <EuiBadge color="warning">
+                                syncing {activeSyncing} agent{activeSyncing !== 1 ? 's' : ''}
+                              </EuiBadge>
+                            </EuiFlexItem>
+                          </>
+                        );
+                      }
+                      return (
+                        <EuiFlexItem grow={false}>
+                          <EuiBadge color={pending > 0 ? 'warning' : 'secondary'}>
+                            pending {pending}
+                          </EuiBadge>
+                        </EuiFlexItem>
+                      );
+                    })()}
+                  </EuiFlexGroup>
+                </EuiFlexItem>
+                <EuiFlexItem grow={false}>
+                  <EuiBadge color={(latestYaraRollout?.stale_pending_agent_ids.length ?? 0) > 0 ? 'warning' : 'secondary'}>
+                    stale {latestYaraRollout?.stale_pending_agent_ids.length ?? 0}
+                  </EuiBadge>
+                </EuiFlexItem>
+                <EuiFlexItem grow={false}>
+                  <EuiBadge color={(latestYaraRollout?.failed_agent_ids.length ?? 0) > 0 ? 'danger' : 'secondary'}>
+                    failed {latestYaraRollout?.failed_agent_ids.length ?? 0}
+                  </EuiBadge>
+                </EuiFlexItem>
+                <EuiFlexItem grow={false}>
+                  <EuiButtonEmpty
+                    size="s"
+                    iconType="refresh"
+                    onClick={() => loadLatestYaraRollout(selectedManagerPolicyID || 'default')}
+                  >
+                    Refresh
+                  </EuiButtonEmpty>
+                </EuiFlexItem>
+              </EuiFlexGroup>
             </EuiFlexItem>
           </EuiFlexGroup>
           <EuiSpacer size="m" />
+          <EuiFlexGroup gutterSize="s" alignItems="center" responsive={false}>
+            <EuiFlexItem grow={false}>
+              <EuiTitle size="xxs">
+                <h5>Failures requiring attention</h5>
+              </EuiTitle>
+            </EuiFlexItem>
+            {yaraRolloutFailureRows.length > 0 && (
+              <>
+                <EuiFlexItem grow={false}>
+                  <EuiBadge color="danger">{yaraRolloutFailureRows.length}</EuiBadge>
+                </EuiFlexItem>
+                <EuiFlexItem grow={false}>
+                  <EuiButton
+                    size="s"
+                    onClick={retryYaraRolloutFailures}
+                    isLoading={isRetryingYaraRollout}
+                  >
+                    Retry all failures
+                  </EuiButton>
+                </EuiFlexItem>
+              </>
+            )}
+          </EuiFlexGroup>
+          <EuiSpacer size="s" />
           {yaraRolloutFailureRows.length === 0 ? (
             <EuiText size="s" color="subdued">
-              <p>No ack failures or stale pending agents for the latest YARA rollout.</p>
+              <p>No failures detected.</p>
             </EuiText>
           ) : (
-            <EuiBasicTable
-              items={yaraRolloutFailureRows}
-              columns={yaraRolloutFailureColumns}
-            />
+            <EuiBasicTable items={yaraRolloutFailureRows} columns={yaraRolloutFailureColumns} />
           )}
         </EuiPanel>
       </>

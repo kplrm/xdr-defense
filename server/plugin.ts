@@ -99,7 +99,6 @@ export class XdrDefenseServerPlugin implements Plugin<Record<string, never>, Rec
       mappings: {
         properties: {
           managerPolicyId: { type: 'keyword' },
-          rolloutVersion: { type: 'integer' },
           action: { type: 'keyword' },
           artifactIdsJSON: { type: 'text', index: false },
           targetAgentIdsJSON: { type: 'text', index: false },

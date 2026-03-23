@@ -96,11 +96,11 @@ export interface YaraRolloutAgentStatus {
   acked_at?: string;
   failure_reason?: string;
   retry_requested_at?: string;
+  retry_in_progress?: boolean;
 }
 
 export interface YaraRolloutSummary {
   manager_policy_id: string;
-  rollout_version: number;
   action: YaraRolloutAction;
   artifact_ids: string[];
   updated_at: string;
@@ -124,7 +124,6 @@ interface RolloutSavedAttributes {
 
 interface YaraRolloutSavedAttributes {
   managerPolicyId: string;
-  rolloutVersion: number;
   action: YaraRolloutAction;
   artifactIdsJSON: string;
   targetAgentIdsJSON: string;
@@ -298,8 +297,8 @@ function rolloutSavedObjectID(policyID: string, postureVersion: number): string 
   return `${policyID}:${postureVersion}`;
 }
 
-function yaraRolloutSavedObjectID(managerPolicyID: string, rolloutVersion: number): string {
-  return `${managerPolicyID || DEFAULT_MANAGER_POLICY_ID}:${rolloutVersion}`;
+function yaraRolloutSavedObjectID(managerPolicyID: string): string {
+  return `yaraRollout-${managerPolicyID || DEFAULT_MANAGER_POLICY_ID}`;
 }
 
 function parseYaraRolloutAgentStatusesJSON(value: string | undefined): YaraRolloutAgentStatus[] {
@@ -334,6 +333,7 @@ function parseYaraRolloutAgentStatusesJSON(value: string | undefined): YaraRollo
         const failureReason = typeof entry.failure_reason === 'string' ? entry.failure_reason : undefined;
         const retryRequestedAt =
           typeof entry.retry_requested_at === 'string' ? entry.retry_requested_at : undefined;
+        const retryInProgress = typeof entry.retry_in_progress === 'boolean' ? entry.retry_in_progress : undefined;
 
         return {
           agent_id: agentID,
@@ -344,6 +344,7 @@ function parseYaraRolloutAgentStatusesJSON(value: string | undefined): YaraRollo
           acked_at: ackedAt,
           failure_reason: failureReason,
           retry_requested_at: retryRequestedAt,
+          retry_in_progress: retryInProgress,
         } as YaraRolloutAgentStatus;
       })
       .filter((entry) => entry.agent_id.length > 0);
@@ -428,7 +429,6 @@ function toYaraRollout(
 
   return {
     manager_policy_id: attributes.managerPolicyId,
-    rollout_version: attributes.rolloutVersion,
     action: attributes.action,
     artifact_ids: artifactIDs,
     updated_at: attributes.updatedAt,
@@ -445,7 +445,6 @@ function toYaraRollout(
 function toYaraRolloutSavedAttributes(summary: YaraRolloutSummary): YaraRolloutSavedAttributes {
   return {
     managerPolicyId: summary.manager_policy_id,
-    rolloutVersion: summary.rollout_version,
     action: summary.action,
     artifactIdsJSON: JSON.stringify(summary.artifact_ids),
     targetAgentIdsJSON: JSON.stringify(summary.target_agent_ids),
@@ -961,8 +960,6 @@ export async function saveYaraRollout(params: {
 }): Promise<YaraRolloutSummary> {
   const repo = await getRepository();
   const normalizedPolicyID = params.managerPolicyID || DEFAULT_MANAGER_POLICY_ID;
-  const existing = await getLatestYaraRollout(normalizedPolicyID);
-  const rolloutVersion = (existing?.rollout_version ?? 0) + 1;
   const now = new Date().toISOString();
 
   const uniqueTargetAgentIDs = [...new Set(params.targetAgentIDs.filter((agentID) => agentID.length > 0))];
@@ -977,7 +974,6 @@ export async function saveYaraRollout(params: {
 
   const nextSummary: YaraRolloutSummary = {
     manager_policy_id: normalizedPolicyID,
-    rollout_version: rolloutVersion,
     action: params.action,
     artifact_ids: uniqueArtifactIDs,
     updated_at: now,
@@ -994,7 +990,7 @@ export async function saveYaraRollout(params: {
     YARA_ROLLOUT_SAVED_OBJECT_TYPE,
     toYaraRolloutSavedAttributes(nextSummary),
     {
-      id: yaraRolloutSavedObjectID(normalizedPolicyID, rolloutVersion),
+      id: yaraRolloutSavedObjectID(normalizedPolicyID),
       overwrite: true,
     }
   );
@@ -1008,25 +1004,22 @@ export async function getLatestYaraRollout(
 ): Promise<YaraRolloutSummary | null> {
   const normalizedPolicyID = managerPolicyID || DEFAULT_MANAGER_POLICY_ID;
   const repo = await getRepository();
-  const result = await repo.find<YaraRolloutSavedAttributes>({
-    type: YARA_ROLLOUT_SAVED_OBJECT_TYPE,
-    perPage: 1000,
-    page: 1,
-    sortField: 'updatedAt',
-    sortOrder: 'desc',
-  });
-
-  const matching = result.saved_objects
-    .map((saved) => toYaraRollout(saved.attributes, staleAfterSeconds))
-    .filter((rollout) => rollout.manager_policy_id === normalizedPolicyID)
-    .sort((a, b) => b.rollout_version - a.rollout_version);
-
-  return matching[0] ?? null;
+  try {
+    const saved = await repo.get<YaraRolloutSavedAttributes>(
+      YARA_ROLLOUT_SAVED_OBJECT_TYPE,
+      yaraRolloutSavedObjectID(normalizedPolicyID)
+    );
+    return toYaraRollout(saved.attributes, staleAfterSeconds);
+  } catch (err) {
+    if (isNotFound(err)) {
+      return null;
+    }
+    throw err;
+  }
 }
 
 export async function acknowledgeYaraRolloutAgent(params: {
   managerPolicyID: string;
-  rolloutVersion: number;
   agentID: string;
   hostname?: string;
   state: Exclude<YaraRolloutAgentState, 'pending'>;
@@ -1035,7 +1028,7 @@ export async function acknowledgeYaraRolloutAgent(params: {
 }): Promise<YaraRolloutSummary | null> {
   const repo = await getRepository();
   const normalizedPolicyID = params.managerPolicyID || DEFAULT_MANAGER_POLICY_ID;
-  const objectID = yaraRolloutSavedObjectID(normalizedPolicyID, params.rolloutVersion);
+  const objectID = yaraRolloutSavedObjectID(normalizedPolicyID);
 
   try {
     const currentSaved = await repo.get<YaraRolloutSavedAttributes>(YARA_ROLLOUT_SAVED_OBJECT_TYPE, objectID);
@@ -1069,6 +1062,7 @@ export async function acknowledgeYaraRolloutAgent(params: {
         acked_at: params.state === 'acked' ? now : undefined,
         failure_reason: params.state === 'failed' ? params.failureReason || 'Agent reported rollout failure' : undefined,
         retry_requested_at: existing?.retry_requested_at,
+        retry_in_progress: false,
       };
     });
 
@@ -1126,8 +1120,7 @@ export async function markYaraRolloutRetry(params: {
       state: 'pending' as const,
       last_attempted_at: now,
       retry_requested_at: now,
-      acked_at: undefined,
-      failure_reason: undefined,
+      retry_in_progress: true,
     };
   });
 
@@ -1146,7 +1139,7 @@ export async function markYaraRolloutRetry(params: {
     YARA_ROLLOUT_SAVED_OBJECT_TYPE,
     toYaraRolloutSavedAttributes(updated),
     {
-      id: yaraRolloutSavedObjectID(updated.manager_policy_id, updated.rollout_version),
+      id: yaraRolloutSavedObjectID(updated.manager_policy_id),
       overwrite: true,
     }
   );

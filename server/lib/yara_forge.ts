@@ -504,10 +504,12 @@ export async function buildSignedYaraBundle(policyID: string): Promise<SignedBun
   const artifacts = await listArtifacts(policyID);
   const yaraArtifacts = artifacts.filter((artifact) => artifact.type === 'yara' && artifact.enabled);
   const rules: BundleRuleEntry[] = [];
+  const missingFiles: string[] = [];
 
   for (const artifact of yaraArtifacts) {
     const filePath = getYaraForgeRuleFilePath(artifact.id);
     if (!fs.existsSync(filePath)) {
+      missingFiles.push(artifact.id);
       continue;
     }
     const content = fs.readFileSync(filePath, 'utf8');
@@ -520,6 +522,18 @@ export async function buildSignedYaraBundle(policyID: string): Promise<SignedBun
       source: 'managed',
       updatedAt: artifact.updatedAt,
     });
+  }
+
+  // If registered artifacts exist but ALL or most rule files are missing, the
+  // data directory has likely been cleared (e.g. container rebuilt without a
+  // volume mount).  Returning an empty bundle would silently wipe all agent
+  // rules, so we surface a hard error that prompts the operator to re-sync.
+  if (missingFiles.length > 0 && rules.length === 0 && yaraArtifacts.length > 0) {
+    throw new Error(
+      `Bundle would be empty: ${yaraArtifacts.length} artifacts registered but all ` +
+      `rule files are missing from disk (e.g. after container rebuild). ` +
+      `Run "Sync YARA Forge Core" to regenerate rule files.`
+    );
   }
 
   const payload: BundlePayload = {

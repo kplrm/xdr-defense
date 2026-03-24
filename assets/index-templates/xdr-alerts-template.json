@@ -1,0 +1,26 @@
+{
+  "index_patterns": ["xdr-alerts-*"],
+  "template": {
+    "settings": {
+      "number_of_shards": 1
+    },
+    "mappings": {
+      "dynamic": true,
+      "properties": {
+        "@timestamp": { "type": "date" },
+        "event.type": { "type": "keyword" },
+        "event.module": { "type": "keyword" },
+        "event.severity": { "type": "integer" },
+        "rule.id": { "type": "keyword" },
+        "rule.name": { "type": "keyword" },
+        "threat.tactic.name": { "type": "keyword" },
+        "threat.technique.id": { "type": "keyword" }
+      }
+    }
+  },
+  "priority": 500,
+  "version": 1,
+  "_meta": {
+    "owner": "xdr-defense"
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "index_patterns": ["xdr-agent-logs-*"],
+  "template": {
+    "settings": {
+      "number_of_shards": 1
+    },
+    "mappings": {
+      "dynamic": true,
+      "properties": {
+        "@timestamp": { "type": "date" },
+        "log.level": { "type": "keyword" },
+        "message": { "type": "text" },
+        "event.module": { "type": "keyword" },
+        "agent.id": { "type": "keyword" },
+        "host.hostname": { "type": "keyword" }
+      }
+    }
+  },
+  "priority": 500,
+  "version": 1,
+  "_meta": {
+    "owner": "xdr-defense"
+  }
+}

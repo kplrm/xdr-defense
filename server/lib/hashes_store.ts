@@ -3,6 +3,9 @@ declare const require: any;
 const crypto = require('crypto');
 const BufferCtor = (globalThis as any).Buffer;
 
+import { readJsonFile, resolvePluginDataPath, writeJsonFile } from './persistent_state';
+import { getSigningPrivateKey } from './signing_keys';
+
 export type HashRuleSource = 'custom' | 'malwarebazaar';
 export type RuleValidationStatus = 'valid' | 'invalid';
 
@@ -68,18 +71,33 @@ interface BundlePayload {
   active_checksums: string[];
 }
 
-interface SigningKeyResult {
-  ok: boolean;
-  privateKey?: any;
-  error?: string;
+interface PersistedBundleState {
+  bundle_version: number;
+  generated_at: string;
+  content_digest: string;
 }
 
-const customRules = new Map<string, HashRuleRecord>();
-const malwareBazaarRules = new Map<string, HashRuleRecord>();
-let bundleVersionCounter = 1;
+interface PersistedHashState {
+  version: 1;
+  customRules: Record<string, HashRuleRecord>;
+  malwareBazaarRules: Record<string, HashRuleRecord>;
+  bundleStates: Record<string, PersistedBundleState>;
+}
+
+const HASH_STATE_FILE = resolvePluginDataPath('registries', 'hash_rules.json');
+let stateCache: PersistedHashState | null = null;
 
 function isoNow(): string {
   return new Date().toISOString();
+}
+
+function defaultState(): PersistedHashState {
+  return {
+    version: 1,
+    customRules: {},
+    malwareBazaarRules: {},
+    bundleStates: {}
+  };
 }
 
 function sanitizeSeverity(raw: unknown): string {
@@ -92,7 +110,7 @@ function sanitizeSeverity(raw: unknown): string {
 
 function sanitizeRuleName(raw: unknown): string {
   const candidate = String(raw ?? '').trim();
-  if (candidate.length === 0) {
+  if (!candidate) {
     return `hash_rule_${Date.now()}`;
   }
   return candidate.slice(0, 160);
@@ -125,7 +143,6 @@ export function validateHashContent(contentRaw: unknown): RuleValidation {
   if (content.trim().length === 0) {
     errors.push('Hash content cannot be empty.');
   }
-
   if (content.length > 200_000) {
     errors.push('Hash content exceeds maximum size (200000 bytes).');
   }
@@ -145,7 +162,6 @@ export function validateHashContent(contentRaw: unknown): RuleValidation {
       invalidLines.push(line);
     }
   }
-
   if (invalidLines.length > 0) {
     errors.push(`Invalid hash lines found: ${invalidLines.slice(0, 3).join(' | ')}`);
   }
@@ -174,8 +190,88 @@ function cloneRule(rule: HashRuleRecord): HashRuleRecord {
   };
 }
 
+function normalizeRule(source: HashRuleSource, raw: unknown): HashRuleRecord | null {
+  if (!raw || typeof raw !== 'object') {
+    return null;
+  }
+  const record = raw as Record<string, unknown>;
+  const id = String(record.id ?? '').trim();
+  const name = sanitizeRuleName(record.name);
+  const content = String(record.content ?? '');
+  if (!id || !content) {
+    return null;
+  }
+
+  const validationRaw = record.validation as Record<string, unknown> | undefined;
+  const validation: RuleValidation = validationRaw && typeof validationRaw === 'object'
+    ? {
+        status: validationRaw.status === 'invalid' ? 'invalid' : 'valid',
+        errors: Array.isArray(validationRaw.errors) ? validationRaw.errors.map((entry) => String(entry)) : [],
+        warnings: Array.isArray(validationRaw.warnings) ? validationRaw.warnings.map((entry) => String(entry)) : [],
+        checkedAt: String(validationRaw.checkedAt ?? isoNow())
+      }
+    : validateHashContent(content);
+
+  return {
+    id,
+    name,
+    source,
+    enabled: Boolean(record.enabled) && validation.status === 'valid',
+    severity: sanitizeSeverity(record.severity),
+    tags: normalizeTags(record.tags),
+    content,
+    updatedAt: String(record.updatedAt ?? isoNow()),
+    validation
+  };
+}
+
+function loadState(): PersistedHashState {
+  if (stateCache) {
+    return stateCache;
+  }
+
+  const raw = readJsonFile<PersistedHashState>(HASH_STATE_FILE, defaultState());
+  const customRules: Record<string, HashRuleRecord> = {};
+  const malwareBazaarRules: Record<string, HashRuleRecord> = {};
+
+  for (const [id, value] of Object.entries(raw?.customRules ?? {})) {
+    const normalized = normalizeRule('custom', { id, ...(value as object) });
+    if (normalized) {
+      customRules[id] = normalized;
+    }
+  }
+
+  for (const [id, value] of Object.entries(raw?.malwareBazaarRules ?? {})) {
+    const normalized = normalizeRule('malwarebazaar', { id, ...(value as object) });
+    if (normalized) {
+      malwareBazaarRules[id] = normalized;
+    }
+  }
+
+  stateCache = {
+    version: 1,
+    customRules,
+    malwareBazaarRules,
+    bundleStates: raw?.bundleStates && typeof raw.bundleStates === 'object' ? raw.bundleStates : {}
+  };
+
+  return stateCache;
+}
+
+function saveState(state: PersistedHashState): void {
+  stateCache = state;
+  writeJsonFile(HASH_STATE_FILE, state);
+}
+
+function nextCustomRuleId(): string {
+  return `hash-custom-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
 function allRules(): HashRuleRecord[] {
-  return [...customRules.values(), ...malwareBazaarRules.values()].map(cloneRule);
+  const state = loadState();
+  return [...Object.values(state.customRules), ...Object.values(state.malwareBazaarRules)]
+    .map(cloneRule)
+    .sort((a, b) => a.name.localeCompare(b.name));
 }
 
 export function listHashRules(): HashRuleSummary[] {
@@ -196,12 +292,9 @@ export function listHashRules(): HashRuleSummary[] {
 }
 
 export function getHashRule(id: string): HashRuleRecord | null {
-  const rule = customRules.get(id) ?? malwareBazaarRules.get(id);
+  const state = loadState();
+  const rule = state.customRules[id] ?? state.malwareBazaarRules[id];
   return rule ? cloneRule(rule) : null;
-}
-
-function nextCustomRuleId(): string {
-  return `hash-custom-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
 export function addCustomHashRule(input: {
@@ -210,6 +303,7 @@ export function addCustomHashRule(input: {
   severity?: unknown;
   tags?: unknown;
 }): HashRuleRecord {
+  const state = loadState();
   const content = String(input.content ?? '');
   const validation = validateHashContent(content);
   const record: HashRuleRecord = {
@@ -223,8 +317,8 @@ export function addCustomHashRule(input: {
     updatedAt: isoNow(),
     validation
   };
-
-  customRules.set(record.id, record);
+  state.customRules[record.id] = record;
+  saveState(state);
   return cloneRule(record);
 }
 
@@ -236,11 +330,12 @@ export function upsertMalwareBazaarHashRule(input: {
   tags?: unknown;
   enabled?: unknown;
 }): { rule: HashRuleRecord; created: boolean; changed: boolean } {
+  const state = loadState();
   const idRaw = String(input.id ?? '').trim();
   const id = idRaw.startsWith('malwarebazaar-') ? idRaw : `malwarebazaar-${idRaw || Date.now()}`;
   const content = String(input.content ?? '');
   const validation = validateHashContent(content);
-  const existing = malwareBazaarRules.get(id);
+  const existing = state.malwareBazaarRules[id];
 
   const candidate: HashRuleRecord = {
     id,
@@ -272,14 +367,16 @@ export function upsertMalwareBazaarHashRule(input: {
     }
   }
 
-  malwareBazaarRules.set(id, candidate);
+  state.malwareBazaarRules[id] = candidate;
+  saveState(state);
   return { rule: cloneRule(candidate), created: !existing, changed: true };
 }
 
 export function getExistingMalwareBazaarHashRuleState(id: unknown): { enabled: boolean } | null {
+  const state = loadState();
   const idRaw = String(id ?? '').trim();
   const normalizedId = idRaw.startsWith('malwarebazaar-') ? idRaw : `malwarebazaar-${idRaw || ''}`;
-  const existing = malwareBazaarRules.get(normalizedId);
+  const existing = state.malwareBazaarRules[normalizedId];
   return existing ? { enabled: existing.enabled } : null;
 }
 
@@ -287,7 +384,8 @@ export function updateHashRule(
   id: string,
   patch: { enabled?: unknown; content?: unknown; severity?: unknown; tags?: unknown; name?: unknown }
 ): { updated: HashRuleRecord | null; error?: string } {
-  const target = customRules.get(id) ?? malwareBazaarRules.get(id);
+  const state = loadState();
+  const target = state.customRules[id] ?? state.malwareBazaarRules[id];
   if (!target) {
     return { updated: null, error: 'Rule not found.' };
   }
@@ -316,89 +414,98 @@ export function updateHashRule(
   next.updatedAt = isoNow();
 
   if (next.source === 'malwarebazaar') {
-    malwareBazaarRules.set(id, next);
+    state.malwareBazaarRules[id] = next;
   } else {
-    customRules.set(id, next);
+    state.customRules[id] = next;
   }
+  saveState(state);
 
   return { updated: cloneRule(next) };
 }
 
 export function deleteHashRule(id: string): { deleted: boolean; error?: string } {
-  const deleted = customRules.delete(id) || malwareBazaarRules.delete(id);
-  if (!deleted) {
-    return { deleted: false, error: 'Rule not found.' };
+  const state = loadState();
+  if (state.customRules[id]) {
+    delete state.customRules[id];
+    saveState(state);
+    return { deleted: true };
   }
-  return { deleted: true };
+  if (state.malwareBazaarRules[id]) {
+    delete state.malwareBazaarRules[id];
+    saveState(state);
+    return { deleted: true };
+  }
+  return { deleted: false, error: 'Rule not found.' };
+}
+
+function buildHashYamlContent(rule: HashRuleRecord): string {
+  const lines = rule.content
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0 && !line.startsWith('#'));
+
+  const entries: string[] = [];
+  for (const line of lines) {
+    let sha256 = '';
+    if (/^sha256:[a-f0-9]{64}(\s+#.*)?$/i.test(line)) {
+      sha256 = line.split(':')[1].split(/\s/)[0].toLowerCase();
+    } else if (/^[a-f0-9]{64}(\s+#.*)?$/.test(line)) {
+      sha256 = line.split(/\s/)[0].toLowerCase();
+    }
+    if (!sha256) {
+      continue;
+    }
+    const escapedName = rule.name.replace(/'/g, "''");
+    const nameYaml = /[:#\[\]{},|>&*!?'"\\]/.test(rule.name) ? `'${escapedName}'` : rule.name;
+    entries.push(`  - sha256: ${sha256}\n    name: ${nameYaml}\n    severity: ${rule.severity}\n    source: ${rule.source}`);
+  }
+
+  if (entries.length === 0) {
+    return 'hashes: []\n';
+  }
+  return `hashes:\n${entries.join('\n')}\n`;
 }
 
 function buildBundleRules(): BundleRuleEntry[] {
   return allRules()
     .filter((rule) => rule.validation.status === 'valid')
-    .map((rule) => ({
-      id: rule.id,
-      filename: `${rule.id}.hashes`,
-      content: rule.content,
-      sha256: crypto.createHash('sha256').update(rule.content, 'utf8').digest('hex'),
-      enabled: rule.enabled,
-      source: rule.source,
-      updatedAt: rule.updatedAt
-    }))
+    .map((rule) => {
+      const content = buildHashYamlContent(rule);
+      return {
+        id: rule.id,
+        filename: `${rule.id}.yaml`,
+        content,
+        sha256: crypto.createHash('sha256').update(content, 'utf8').digest('hex'),
+        enabled: rule.enabled,
+        source: rule.source,
+        updatedAt: rule.updatedAt
+      };
+    })
     .sort((a, b) => a.id.localeCompare(b.id));
 }
 
-function parseSigningPrivateKey(): SigningKeyResult {
-  const encoded = String(process.env.XDR_DEFENSE_SIGNING_PRIVATE_KEY_B64 ?? '').trim();
-  if (!encoded) {
-    return {
-      ok: false,
-      error:
-        'XDR_DEFENSE_SIGNING_PRIVATE_KEY_B64 is not configured. Provide base64 raw 32-byte seed or 64-byte private key.'
-    };
-  }
-
-  let raw: any;
-  try {
-    raw = BufferCtor.from(encoded, 'base64');
-  } catch (_err) {
-    return { ok: false, error: 'Signing private key is not valid base64.' };
-  }
-
-  if (!raw || !raw.length) {
-    return { ok: false, error: 'Signing private key decode produced empty bytes.' };
-  }
-
-  let seed = raw;
-  if (raw.length === 64) {
-    seed = raw.subarray(0, 32);
-  }
-
-  if (seed.length !== 32) {
-    return {
-      ok: false,
-      error: `Signing private key must decode to 32-byte seed or 64-byte private key, got ${raw.length} bytes.`
-    };
-  }
-
-  try {
-    const pkcs8Prefix = BufferCtor.from('302e020100300506032b657004220420', 'hex');
-    const pkcs8 = BufferCtor.concat([pkcs8Prefix, seed]);
-    const privateKey = crypto.createPrivateKey({
-      key: pkcs8,
-      format: 'der',
-      type: 'pkcs8'
-    });
-    return { ok: true, privateKey };
-  } catch (err: any) {
-    return {
-      ok: false,
-      error: `Unable to construct Ed25519 private key: ${String(err?.message ?? err)}`
-    };
-  }
+function bundleContentDigest(policyId: string, rules: BundleRuleEntry[], activeChecksums: string[]): string {
+  return crypto
+    .createHash('sha256')
+    .update(
+      JSON.stringify({
+        policy_id: policyId,
+        rules: rules.map((rule) => ({
+          id: rule.id,
+          sha256: rule.sha256,
+          enabled: rule.enabled,
+          source: rule.source,
+          updatedAt: rule.updatedAt
+        })),
+        active_checksums: activeChecksums
+      }),
+      'utf8'
+    )
+    .digest('hex');
 }
 
 export function getHashSigningReadiness(): { ready: boolean; reason?: string } {
-  const key = parseSigningPrivateKey();
+  const key = getSigningPrivateKey();
   if (!key.ok) {
     return { ready: false, reason: key.error };
   }
@@ -406,22 +513,39 @@ export function getHashSigningReadiness(): { ready: boolean; reason?: string } {
 }
 
 export function buildSignedHashBundle(policyId: string): { bundle?: SignedBundleResponse; error?: string } {
-  const keyResult = parseSigningPrivateKey();
+  const keyResult = getSigningPrivateKey();
   if (!keyResult.ok || !keyResult.privateKey) {
     return { error: keyResult.error ?? 'Signing key is unavailable.' };
   }
 
+  const state = loadState();
   const bundleRules = buildBundleRules();
   const activeChecksums = bundleRules
     .filter((entry) => entry.enabled)
     .map((entry) => entry.sha256)
     .sort((a, b) => a.localeCompare(b));
 
+  const digest = bundleContentDigest(policyId, bundleRules, activeChecksums);
+  const existingBundle = state.bundleStates[policyId];
+  const bundleState =
+    existingBundle && existingBundle.content_digest === digest
+      ? existingBundle
+      : {
+          bundle_version: (existingBundle?.bundle_version ?? 0) + 1,
+          generated_at: isoNow(),
+          content_digest: digest
+        };
+
+  if (!existingBundle || existingBundle.content_digest !== digest) {
+    state.bundleStates[policyId] = bundleState;
+    saveState(state);
+  }
+
   const payload: BundlePayload = {
     manifest_version: 1,
     policy_id: policyId,
-    bundle_version: bundleVersionCounter++,
-    generated_at: isoNow(),
+    bundle_version: bundleState.bundle_version,
+    generated_at: bundleState.generated_at,
     signing_alg: 'ed25519',
     rules: bundleRules,
     active_checksums: activeChecksums

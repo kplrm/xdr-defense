@@ -3,6 +3,9 @@ declare const require: any;
 const crypto = require('crypto');
 const BufferCtor = (globalThis as any).Buffer;
 
+import { readJsonFile, resolvePluginDataPath, writeJsonFile } from './persistent_state';
+import { getSigningPrivateKey } from './signing_keys';
+
 export type YaraRuleSource = 'builtin' | 'custom' | 'forge-core';
 export type YaraValidationStatus = 'valid' | 'invalid';
 
@@ -68,19 +71,45 @@ interface BundlePayload {
   active_checksums: string[];
 }
 
-interface SigningKeyResult {
-  ok: boolean;
-  privateKey?: any;
-  error?: string;
+interface PersistedBundleState {
+  bundle_version: number;
+  generated_at: string;
+  content_digest: string;
 }
 
-const builtinRules = new Map<string, YaraRuleRecord>();
-const customRules = new Map<string, YaraRuleRecord>();
-const forgeCoreRules = new Map<string, YaraRuleRecord>();
-let bundleVersionCounter = 1;
+interface PersistedYaraState {
+  version: 1;
+  customRules: Record<string, YaraRuleRecord>;
+  forgeCoreRules: Record<string, YaraRuleRecord>;
+  bundleStates: Record<string, PersistedBundleState>;
+}
+
+const YARA_STATE_FILE = resolvePluginDataPath('registries', 'yara_rules.json');
+let stateCache: PersistedYaraState | null = null;
 
 function isoNow(): string {
   return new Date().toISOString();
+}
+
+function defaultState(): PersistedYaraState {
+  return {
+    version: 1,
+    customRules: {},
+    forgeCoreRules: {},
+    bundleStates: {}
+  };
+}
+
+function cloneRule(rule: YaraRuleRecord): YaraRuleRecord {
+  return {
+    ...rule,
+    tags: [...rule.tags],
+    validation: {
+      ...rule.validation,
+      errors: [...rule.validation.errors],
+      warnings: [...rule.validation.warnings]
+    }
+  };
 }
 
 function normalizeTags(tags: unknown): string[] {
@@ -103,61 +132,10 @@ function sanitizeSeverity(raw: unknown): string {
 
 function sanitizeRuleName(raw: unknown): string {
   const candidate = String(raw ?? '').trim();
-  if (candidate.length === 0) {
+  if (!candidate) {
     return `custom_rule_${Date.now()}`;
   }
   return candidate.slice(0, 160);
-}
-
-function ensureBuiltins(): void {
-  if (builtinRules.size > 0) {
-    return;
-  }
-
-  const builtinEntries: Array<Pick<YaraRuleRecord, 'id' | 'name' | 'severity' | 'tags' | 'content'>> = [
-    {
-      id: 'builtin-suspicious-powershell',
-      name: 'Suspicious PowerShell EncodedCommand',
-      severity: 'high',
-      tags: ['builtin', 'powershell', 'execution'],
-      content:
-        'rule suspicious_powershell_encoded_command {\n' +
-        '  strings:\n' +
-        '    $cmd = "-EncodedCommand" nocase\n' +
-        '  condition:\n' +
-        '    $cmd\n' +
-        '}'
-    },
-    {
-      id: 'builtin-ransom-note-string',
-      name: 'Ransom Note Indicator String',
-      severity: 'critical',
-      tags: ['builtin', 'ransomware', 'files'],
-      content:
-        'rule ransom_note_indicator_string {\n' +
-        '  strings:\n' +
-        '    $s1 = "your files have been encrypted" nocase\n' +
-        '  condition:\n' +
-        '    $s1\n' +
-        '}'
-    }
-  ];
-
-  const now = isoNow();
-  for (const entry of builtinEntries) {
-    const validation = validateYaraContent(entry.content, entry.name);
-    builtinRules.set(entry.id, {
-      id: entry.id,
-      name: entry.name,
-      source: 'builtin',
-      enabled: true,
-      severity: entry.severity,
-      tags: entry.tags,
-      content: entry.content,
-      updatedAt: now,
-      validation
-    });
-  }
 }
 
 export function validateYaraContent(contentRaw: unknown, expectedName?: string): YaraRuleValidation {
@@ -168,7 +146,6 @@ export function validateYaraContent(contentRaw: unknown, expectedName?: string):
   if (content.trim().length === 0) {
     errors.push('Rule content cannot be empty.');
   }
-
   if (content.length > 200_000) {
     errors.push('Rule content exceeds maximum size (200000 bytes).');
   }
@@ -181,9 +158,7 @@ export function validateYaraContent(contentRaw: unknown, expectedName?: string):
   if (expectedName && ruleNameMatch && expectedName.trim().length > 0) {
     const normalizedExpected = expectedName.trim().replace(/\s+/g, '_');
     if (ruleNameMatch[1] !== normalizedExpected) {
-      warnings.push(
-        `Rule declaration name (${ruleNameMatch[1]}) does not match provided name (${normalizedExpected}).`
-      );
+      warnings.push(`Rule declaration name (${ruleNameMatch[1]}) does not match provided name (${normalizedExpected}).`);
     }
   }
 
@@ -191,22 +166,50 @@ export function validateYaraContent(contentRaw: unknown, expectedName?: string):
     errors.push('Missing YARA condition section.');
   }
 
-  let openBraces = 0;
-  for (const char of content) {
-    if (char === '{') {
-      openBraces += 1;
-    }
-    if (char === '}') {
-      openBraces -= 1;
-      if (openBraces < 0) {
-        errors.push('Mismatched braces found in rule content.');
-        break;
+  // Brace balance check — skips braces inside string literals and comments so
+  // YARA rules with `{` inside string values (e.g. $s = "{path}\\file") or
+  // inside /* comments */ don't produce false-positive "unbalanced" errors.
+  {
+    let openBraces = 0;
+    let inString = false;
+    let inBlockComment = false;
+    let inLineComment = false;
+    let i = 0;
+    let mismatch = false;
+    while (i < content.length) {
+      const ch = content[i];
+      const next = i + 1 < content.length ? content[i + 1] : '';
+      if (inLineComment) {
+        if (ch === '\n') inLineComment = false;
+        i++; continue;
       }
+      if (inBlockComment) {
+        if (ch === '*' && next === '/') { inBlockComment = false; i += 2; continue; }
+        i++; continue;
+      }
+      if (inString) {
+        if (ch === '\\') { i += 2; continue; } // skip escaped character
+        if (ch === '"') inString = false;
+        i++; continue;
+      }
+      if (ch === '/' && next === '/') { inLineComment = true; i += 2; continue; }
+      if (ch === '/' && next === '*') { inBlockComment = true; i += 2; continue; }
+      if (ch === '"') { inString = true; i++; continue; }
+      if (ch === '{') { openBraces++; i++; continue; }
+      if (ch === '}') {
+        openBraces--;
+        if (openBraces < 0) {
+          errors.push('Mismatched braces found in rule content.');
+          mismatch = true;
+          break;
+        }
+        i++; continue;
+      }
+      i++;
     }
-  }
-
-  if (openBraces !== 0) {
-    errors.push('Unbalanced braces in rule content.');
+    if (!mismatch && openBraces !== 0) {
+      errors.push('Unbalanced braces in rule content.');
+    }
   }
 
   return {
@@ -217,21 +220,148 @@ export function validateYaraContent(contentRaw: unknown, expectedName?: string):
   };
 }
 
-function cloneRule(rule: YaraRuleRecord): YaraRuleRecord {
+function normalizeRule(source: YaraRuleSource, raw: unknown): YaraRuleRecord | null {
+  if (!raw || typeof raw !== 'object') {
+    return null;
+  }
+  const record = raw as Record<string, unknown>;
+  const id = String(record.id ?? '').trim();
+  const name = sanitizeRuleName(record.name);
+  const content = String(record.content ?? '');
+  if (!id || !content) {
+    return null;
+  }
+
+  const validationRaw = record.validation as Record<string, unknown> | undefined;
+  const validation: YaraRuleValidation = validationRaw && typeof validationRaw === 'object'
+    ? {
+        status: validationRaw.status === 'invalid' ? 'invalid' : 'valid',
+        errors: Array.isArray(validationRaw.errors) ? validationRaw.errors.map((entry) => String(entry)) : [],
+        warnings: Array.isArray(validationRaw.warnings) ? validationRaw.warnings.map((entry) => String(entry)) : [],
+        checkedAt: String(validationRaw.checkedAt ?? isoNow())
+      }
+    : validateYaraContent(content, name);
+
   return {
-    ...rule,
-    tags: [...rule.tags],
-    validation: {
-      ...rule.validation,
-      errors: [...rule.validation.errors],
-      warnings: [...rule.validation.warnings]
-    }
+    id,
+    name,
+    source,
+    enabled: Boolean(record.enabled) && validation.status === 'valid',
+    severity: sanitizeSeverity(record.severity),
+    tags: normalizeTags(record.tags),
+    content,
+    updatedAt: String(record.updatedAt ?? isoNow()),
+    validation
   };
 }
 
+function loadState(): PersistedYaraState {
+  if (stateCache) {
+    return stateCache;
+  }
+
+  const raw = readJsonFile<PersistedYaraState>(YARA_STATE_FILE, defaultState());
+  const customRules: Record<string, YaraRuleRecord> = {};
+  const forgeCoreRules: Record<string, YaraRuleRecord> = {};
+
+  for (const [id, value] of Object.entries(raw?.customRules ?? {})) {
+    const normalized = normalizeRule('custom', { id, ...(value as object) });
+    if (normalized) {
+      customRules[id] = normalized;
+    }
+  }
+
+  for (const [id, value] of Object.entries(raw?.forgeCoreRules ?? {})) {
+    const normalized = normalizeRule('forge-core', { id, ...(value as object) });
+    if (normalized) {
+      forgeCoreRules[id] = normalized;
+    }
+  }
+
+  stateCache = {
+    version: 1,
+    customRules,
+    forgeCoreRules,
+    bundleStates: raw?.bundleStates && typeof raw.bundleStates === 'object' ? raw.bundleStates : {}
+  };
+
+  // One-time migration: re-validate any rule whose only error was the now-fixed
+  // naive brace counter producing false positives (e.g. `{` inside string literals).
+  let migrationChanges = 0;
+  for (const rules of [customRules, forgeCoreRules]) {
+    for (const rule of Object.values(rules)) {
+      if (
+        rule.validation.status === 'invalid' &&
+        rule.validation.errors.length > 0 &&
+        rule.validation.errors.every(
+          (e) => e === 'Unbalanced braces in rule content.' || e === 'Mismatched braces found in rule content.'
+        )
+      ) {
+        const revalidated = validateYaraContent(rule.content);
+        if (revalidated.status === 'valid') {
+          rule.validation = revalidated;
+          rule.enabled = true;
+          migrationChanges++;
+        }
+      }
+    }
+  }
+  if (migrationChanges > 0) {
+    saveState(stateCache);
+  }
+
+  return stateCache;
+}
+
+function saveState(state: PersistedYaraState): void {
+  stateCache = state;
+  writeJsonFile(YARA_STATE_FILE, state);
+}
+
+function nextCustomRuleId(): string {
+  return `custom-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
 function allRules(): YaraRuleRecord[] {
-  ensureBuiltins();
-  return [...builtinRules.values(), ...customRules.values(), ...forgeCoreRules.values()].map(cloneRule);
+  const state = loadState();
+  return [...Object.values(state.customRules), ...Object.values(state.forgeCoreRules)]
+    .map(cloneRule)
+    .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function buildBundleRules(): BundleRuleEntry[] {
+  return allRules()
+    .filter((rule) => rule.validation.status === 'valid')
+    .map((rule) => ({
+      id: rule.id,
+      filename: `${rule.id}.yar`,
+      content: rule.content,
+      sha256: crypto.createHash('sha256').update(rule.content, 'utf8').digest('hex'),
+      enabled: rule.enabled,
+      source: rule.source,
+      updatedAt: rule.updatedAt
+    }))
+    .sort((a, b) => a.id.localeCompare(b.id));
+}
+
+function bundleContentDigest(policyId: string, rules: BundleRuleEntry[], activeChecksums: string[]): string {
+  return crypto
+    .createHash('sha256')
+    .update(
+      JSON.stringify({
+        policy_id: policyId,
+        rules: rules.map((rule) => ({
+          id: rule.id,
+          sha256: rule.sha256,
+          enabled: rule.enabled,
+          source: rule.source,
+          updatedAt: rule.updatedAt
+        })),
+        active_checksums: activeChecksums
+      }),
+      'utf8'
+    )
+    .digest('hex');
 }
 
 export function listYaraRules(): YaraRuleSummary[] {
@@ -252,13 +382,9 @@ export function listYaraRules(): YaraRuleSummary[] {
 }
 
 export function getYaraRule(id: string): YaraRuleRecord | null {
-  ensureBuiltins();
-  const rule = customRules.get(id) ?? forgeCoreRules.get(id) ?? builtinRules.get(id);
+  const state = loadState();
+  const rule = state.customRules[id] ?? state.forgeCoreRules[id];
   return rule ? cloneRule(rule) : null;
-}
-
-function nextCustomRuleId(): string {
-  return `custom-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
 export function addCustomYaraRule(input: {
@@ -267,7 +393,7 @@ export function addCustomYaraRule(input: {
   severity?: unknown;
   tags?: unknown;
 }): YaraRuleRecord {
-  ensureBuiltins();
+  const state = loadState();
   const name = sanitizeRuleName(input.name);
   const content = String(input.content ?? '');
   const validation = validateYaraContent(content, name);
@@ -284,7 +410,8 @@ export function addCustomYaraRule(input: {
     validation
   };
 
-  customRules.set(record.id, record);
+  state.customRules[record.id] = record;
+  saveState(state);
   return cloneRule(record);
 }
 
@@ -296,15 +423,14 @@ export function upsertForgeCoreYaraRule(input: {
   tags?: unknown;
   enabled?: unknown;
 }): { rule: YaraRuleRecord; created: boolean; changed: boolean } {
-  ensureBuiltins();
-
+  const state = loadState();
   const idRaw = String(input.id ?? '').trim();
   const id = idRaw.startsWith('forge-core-') ? idRaw : `forge-core-${idRaw || Date.now()}`;
   const name = sanitizeRuleName(input.name);
   const content = String(input.content ?? '');
   const validation = validateYaraContent(content, name);
+  const existing = state.forgeCoreRules[id];
 
-  const existing = forgeCoreRules.get(id);
   const candidate: YaraRuleRecord = {
     id,
     name,
@@ -335,15 +461,16 @@ export function upsertForgeCoreYaraRule(input: {
     }
   }
 
-  forgeCoreRules.set(id, candidate);
+  state.forgeCoreRules[id] = candidate;
+  saveState(state);
   return { rule: cloneRule(candidate), created: !existing, changed: true };
 }
 
 export function getExistingForgeCoreRuleState(id: unknown): { enabled: boolean } | null {
-  ensureBuiltins();
+  const state = loadState();
   const idRaw = String(id ?? '').trim();
   const normalizedId = idRaw.startsWith('forge-core-') ? idRaw : `forge-core-${idRaw || ''}`;
-  const existing = forgeCoreRules.get(normalizedId);
+  const existing = state.forgeCoreRules[normalizedId];
   return existing ? { enabled: existing.enabled } : null;
 }
 
@@ -357,34 +484,25 @@ export function updateYaraRule(
     name?: unknown;
   }
 ): { updated: YaraRuleRecord | null; error?: string } {
-  ensureBuiltins();
-  const target = customRules.get(id) ?? forgeCoreRules.get(id) ?? builtinRules.get(id);
+  const state = loadState();
+  const target = state.customRules[id] ?? state.forgeCoreRules[id];
   if (!target) {
     return { updated: null, error: 'Rule not found.' };
   }
 
-  if (target.source === 'builtin' && patch.content !== undefined) {
-    return { updated: null, error: 'Builtin rule content is read-only.' };
-  }
-
-  const next: YaraRuleRecord = cloneRule(target);
-
+  const next = cloneRule(target);
   if (patch.name !== undefined) {
     next.name = sanitizeRuleName(patch.name);
   }
-
   if (patch.content !== undefined) {
     next.content = String(patch.content ?? '');
   }
-
   if (patch.severity !== undefined) {
     next.severity = sanitizeSeverity(patch.severity);
   }
-
   if (patch.tags !== undefined) {
     next.tags = normalizeTags(patch.tags);
   }
-
   if (patch.enabled !== undefined) {
     next.enabled = Boolean(patch.enabled);
   }
@@ -393,100 +511,35 @@ export function updateYaraRule(
   if (next.validation.status === 'invalid') {
     next.enabled = false;
   }
-
   next.updatedAt = isoNow();
 
-  if (next.source === 'custom') {
-    customRules.set(id, next);
-  } else if (next.source === 'forge-core') {
-    forgeCoreRules.set(id, next);
+  if (next.source === 'forge-core') {
+    state.forgeCoreRules[id] = next;
   } else {
-    builtinRules.set(id, next);
+    state.customRules[id] = next;
   }
+  saveState(state);
 
   return { updated: cloneRule(next) };
 }
 
 export function deleteCustomYaraRule(id: string): { deleted: boolean; error?: string } {
-  ensureBuiltins();
-  const builtin = builtinRules.get(id);
-  if (builtin) {
-    return { deleted: false, error: 'Builtin rules cannot be deleted.' };
+  const state = loadState();
+  if (state.customRules[id]) {
+    delete state.customRules[id];
+    saveState(state);
+    return { deleted: true };
   }
-  const deleted = customRules.delete(id) || forgeCoreRules.delete(id);
-  if (!deleted) {
-    return { deleted: false, error: 'Rule not found.' };
+  if (state.forgeCoreRules[id]) {
+    delete state.forgeCoreRules[id];
+    saveState(state);
+    return { deleted: true };
   }
-  return { deleted: true };
-}
-
-function buildBundleRules(): BundleRuleEntry[] {
-  return allRules()
-    .filter((rule) => rule.validation.status === 'valid')
-    .map((rule) => ({
-      id: rule.id,
-      filename: `${rule.id}.yar`,
-      content: rule.content,
-      sha256: crypto.createHash('sha256').update(rule.content, 'utf8').digest('hex'),
-      enabled: rule.enabled,
-      source: rule.source,
-      updatedAt: rule.updatedAt
-    }))
-    .sort((a, b) => a.id.localeCompare(b.id));
-}
-
-function parseSigningPrivateKey(): SigningKeyResult {
-  const encoded = String(process.env.XDR_DEFENSE_SIGNING_PRIVATE_KEY_B64 ?? '').trim();
-  if (!encoded) {
-    return {
-      ok: false,
-      error:
-        'XDR_DEFENSE_SIGNING_PRIVATE_KEY_B64 is not configured. Provide base64 raw 32-byte seed or 64-byte private key.'
-    };
-  }
-
-  let raw: any;
-  try {
-    raw = BufferCtor.from(encoded, 'base64');
-  } catch (_err) {
-    return { ok: false, error: 'Signing private key is not valid base64.' };
-  }
-
-  if (!raw || !raw.length) {
-    return { ok: false, error: 'Signing private key decode produced empty bytes.' };
-  }
-
-  let seed = raw;
-  if (raw.length === 64) {
-    seed = raw.subarray(0, 32);
-  }
-
-  if (seed.length !== 32) {
-    return {
-      ok: false,
-      error: `Signing private key must decode to 32-byte seed or 64-byte private key, got ${raw.length} bytes.`
-    };
-  }
-
-  try {
-    const pkcs8Prefix = BufferCtor.from('302e020100300506032b657004220420', 'hex');
-    const pkcs8 = BufferCtor.concat([pkcs8Prefix, seed]);
-    const privateKey = crypto.createPrivateKey({
-      key: pkcs8,
-      format: 'der',
-      type: 'pkcs8'
-    });
-    return { ok: true, privateKey };
-  } catch (err: any) {
-    return {
-      ok: false,
-      error: `Unable to construct Ed25519 private key: ${String(err?.message ?? err)}`
-    };
-  }
+  return { deleted: false, error: 'Rule not found.' };
 }
 
 export function getSigningReadiness(): { ready: boolean; reason?: string } {
-  const key = parseSigningPrivateKey();
+  const key = getSigningPrivateKey();
   if (!key.ok) {
     return { ready: false, reason: key.error };
   }
@@ -494,22 +547,39 @@ export function getSigningReadiness(): { ready: boolean; reason?: string } {
 }
 
 export function buildSignedYaraBundle(policyId: string): { bundle?: SignedBundleResponse; error?: string } {
-  const keyResult = parseSigningPrivateKey();
+  const keyResult = getSigningPrivateKey();
   if (!keyResult.ok || !keyResult.privateKey) {
     return { error: keyResult.error ?? 'Signing key is unavailable.' };
   }
 
+  const state = loadState();
   const bundleRules = buildBundleRules();
   const activeChecksums = bundleRules
     .filter((entry) => entry.enabled)
     .map((entry) => entry.sha256)
     .sort((a, b) => a.localeCompare(b));
 
+  const digest = bundleContentDigest(policyId, bundleRules, activeChecksums);
+  const existingBundle = state.bundleStates[policyId];
+  const bundleState =
+    existingBundle && existingBundle.content_digest === digest
+      ? existingBundle
+      : {
+          bundle_version: (existingBundle?.bundle_version ?? 0) + 1,
+          generated_at: isoNow(),
+          content_digest: digest
+        };
+
+  if (!existingBundle || existingBundle.content_digest !== digest) {
+    state.bundleStates[policyId] = bundleState;
+    saveState(state);
+  }
+
   const payload: BundlePayload = {
     manifest_version: 1,
     policy_id: policyId,
-    bundle_version: bundleVersionCounter++,
-    generated_at: isoNow(),
+    bundle_version: bundleState.bundle_version,
+    generated_at: bundleState.generated_at,
     signing_alg: 'ed25519',
     rules: bundleRules,
     active_checksums: activeChecksums

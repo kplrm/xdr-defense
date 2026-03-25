@@ -5,7 +5,7 @@
   "description": "OpenSearch Dashboards plugin for detection/prevention management",
   "main": "index.js",
   "scripts": {
-    "build": "yarn plugin-helpers build",
+    "build": "bash ./scripts/build_external.sh",
     "plugin-helpers": "node ../OpenSearch-Dashboards/scripts/plugin_helpers",
     "osd": "node ../OpenSearch-Dashboards/scripts/osd",
     "lint": "echo lint placeholder"

@@ -3,6 +3,8 @@ declare const require: any;
 const crypto = require('crypto');
 const BufferCtor = (globalThis as any).Buffer;
 
+import { getSigningPrivateKey } from './signing_keys';
+
 export type BehavioralRuleSource = 'custom' | 'sigmahq';
 export type RuleValidationStatus = 'valid' | 'invalid';
 
@@ -66,12 +68,6 @@ interface BundlePayload {
   signing_alg: 'ed25519';
   rules: BundleRuleEntry[];
   active_checksums: string[];
-}
-
-interface SigningKeyResult {
-  ok: boolean;
-  privateKey?: any;
-  error?: string;
 }
 
 const customRules = new Map<string, BehavioralRuleRecord>();
@@ -326,58 +322,8 @@ function buildBundleRules(): BundleRuleEntry[] {
     .sort((a, b) => a.id.localeCompare(b.id));
 }
 
-function parseSigningPrivateKey(): SigningKeyResult {
-  const encoded = String(process.env.XDR_DEFENSE_SIGNING_PRIVATE_KEY_B64 ?? '').trim();
-  if (!encoded) {
-    return {
-      ok: false,
-      error:
-        'XDR_DEFENSE_SIGNING_PRIVATE_KEY_B64 is not configured. Provide base64 raw 32-byte seed or 64-byte private key.'
-    };
-  }
-
-  let raw: any;
-  try {
-    raw = BufferCtor.from(encoded, 'base64');
-  } catch (_err) {
-    return { ok: false, error: 'Signing private key is not valid base64.' };
-  }
-
-  if (!raw || !raw.length) {
-    return { ok: false, error: 'Signing private key decode produced empty bytes.' };
-  }
-
-  let seed = raw;
-  if (raw.length === 64) {
-    seed = raw.subarray(0, 32);
-  }
-
-  if (seed.length !== 32) {
-    return {
-      ok: false,
-      error: `Signing private key must decode to 32-byte seed or 64-byte private key, got ${raw.length} bytes.`
-    };
-  }
-
-  try {
-    const pkcs8Prefix = BufferCtor.from('302e020100300506032b657004220420', 'hex');
-    const pkcs8 = BufferCtor.concat([pkcs8Prefix, seed]);
-    const privateKey = crypto.createPrivateKey({
-      key: pkcs8,
-      format: 'der',
-      type: 'pkcs8'
-    });
-    return { ok: true, privateKey };
-  } catch (err: any) {
-    return {
-      ok: false,
-      error: `Unable to construct Ed25519 private key: ${String(err?.message ?? err)}`
-    };
-  }
-}
-
 export function getBehavioralSigningReadiness(): { ready: boolean; reason?: string } {
-  const key = parseSigningPrivateKey();
+  const key = getSigningPrivateKey();
   if (!key.ok) {
     return { ready: false, reason: key.error };
   }
@@ -385,7 +331,7 @@ export function getBehavioralSigningReadiness(): { ready: boolean; reason?: stri
 }
 
 export function buildSignedBehavioralBundle(policyId: string): { bundle?: SignedBundleResponse; error?: string } {
-  const keyResult = parseSigningPrivateKey();
+  const keyResult = getSigningPrivateKey();
   if (!keyResult.ok || !keyResult.privateKey) {
     return { error: keyResult.error ?? 'Signing key is unavailable.' };
   }

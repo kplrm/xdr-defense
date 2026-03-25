@@ -12,10 +12,12 @@ import {
   updateYaraRule,
   validateYaraContent
 } from '../lib/yara_store';
-import { loadForgeCoreSources, syncForgeCoreWithWorkerPool } from '../lib/yara_forge';
+import { fetchLatestYaraForgeCoreRelease } from '../lib/yara_forge_release';
+import { getYaraForgeSyncState, updateYaraForgeSyncState } from '../lib/upstream_sync_store';
 import {
   acknowledgeRollout,
   dispatchRolloutForAgents,
+  ingestYaraRolloutStatusReport,
   listEnrolledAgents,
   listRolloutStatus,
   retryRetryableCommands
@@ -29,6 +31,81 @@ interface TestResult {
   total_hits: number;
   simulated_matches: number;
   query_error?: string;
+}
+
+type ForgeCoreSyncStatus = 'idle' | 'processing' | 'completed' | 'failed';
+type ForgeCoreSyncPhase = 'idle' | 'downloading' | 'validating' | 'rollout' | 'completed' | 'failed';
+
+interface ForgeCoreSyncMetadata {
+  status: ForgeCoreSyncStatus;
+  phase?: ForgeCoreSyncPhase;
+  sync_id?: string;
+  started_at?: string;
+  completed_at?: string;
+  synced_at?: string;
+  attempted?: number;
+  loaded?: number;
+  imported?: number;
+  unchanged?: number;
+  removed?: number;
+  load_failures?: number;
+  active_rules_queued?: number;
+  release_tag?: string;
+  asset_name?: string;
+  rollout?: {
+    target_agent_commands: number;
+    created: number;
+    deduplicated: number;
+    planned_rules?: number;
+    processed_rules?: number;
+  };
+  message?: string;
+  errors?: string[];
+}
+
+let forgeCoreSyncMetadata: ForgeCoreSyncMetadata = { status: 'idle' };
+let forgeCoreSyncInFlight = false;
+
+function persistedSyncMetadataSnapshot(): ForgeCoreSyncMetadata {
+  const persisted = getYaraForgeSyncState();
+  if (!persisted.last_attempted_at) {
+    return { status: 'idle' };
+  }
+
+  const failed = Boolean(persisted.last_error);
+  return {
+    status: failed ? 'failed' : 'completed',
+    phase: failed ? 'failed' : persisted.phase ?? 'completed',
+    started_at: persisted.last_attempted_at,
+    completed_at: persisted.last_completed_at,
+    synced_at: persisted.last_successful_sync_at,
+    attempted: persisted.attempted,
+    loaded: persisted.loaded,
+    imported: persisted.imported,
+    unchanged: persisted.unchanged,
+    removed: persisted.removed,
+    load_failures: persisted.load_failures,
+    active_rules_queued: persisted.active_rules_queued,
+    release_tag: persisted.release_tag,
+    asset_name: persisted.asset_name,
+    rollout: persisted.rollout,
+    message: failed ? 'Last YARA Forge Core sync failed.' : 'Last YARA Forge Core sync completed.',
+    errors: failed && persisted.last_error ? [persisted.last_error] : []
+  };
+}
+
+function syncMetadataSnapshot(): ForgeCoreSyncMetadata {
+  if (forgeCoreSyncMetadata.status === 'idle') {
+    return persistedSyncMetadataSnapshot();
+  }
+  return {
+    ...forgeCoreSyncMetadata,
+    errors: [...(forgeCoreSyncMetadata.errors ?? [])]
+  };
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function simulateAgainstRecentDocs(
@@ -145,6 +222,148 @@ async function dispatchRuleRollout(ctx: any, rule: { id: string; name: string; u
     dispatched: dispatch.dispatched,
     deduplicated: dispatch.deduplicated
   };
+}
+
+// ACK validation schema (shared between current and legacy routes)
+const ackValidationSchema = {
+  body: schema.object({
+    command_id: schema.maybe(schema.string({ minLength: 1, maxLength: 128 })),
+    command_key: schema.maybe(schema.string({ minLength: 1, maxLength: 512 })),
+    agent_id: schema.string({ minLength: 1, maxLength: 256 }),
+    rule_id: schema.maybe(schema.string({ minLength: 1, maxLength: 256 })),
+    action: schema.maybe(schema.oneOf([schema.literal('activate'), schema.literal('deactivate'), schema.literal('delete')])),
+    dispatch_version: schema.maybe(schema.string({ minLength: 1, maxLength: 128 })),
+    status: schema.oneOf([schema.literal('acknowledged'), schema.literal('failed')]),
+    reason: schema.maybe(schema.string({ minLength: 1, maxLength: 2048 }))
+  })
+};
+
+// Rule-status validation schema (shared between current and legacy routes)
+const rolloutStatusValidationSchema = {
+  body: schema.object({
+    manager_policy_id: schema.string({ minLength: 1, maxLength: 256 }),
+    agent_id: schema.string({ minLength: 1, maxLength: 256 }),
+    state: schema.oneOf([schema.literal('acked'), schema.literal('partial'), schema.literal('failed')]),
+    total_rules: schema.number({ min: 0 }),
+    loaded_rules: schema.number({ min: 0 }),
+    failed_rules: schema.arrayOf(
+      schema.object({
+        rule_id: schema.string({ minLength: 1, maxLength: 512 }),
+        status: schema.string({ minLength: 1, maxLength: 64 }),
+        error_message: schema.maybe(schema.string({ minLength: 1, maxLength: 4096 })),
+        loaded_at: schema.maybe(schema.number({ min: 0 }))
+      }),
+      { defaultValue: [] }
+    ),
+    reported_at: schema.number({ min: 0 })
+  })
+};
+
+// Handler functions for rollout endpoints (shared between current and legacy routes)
+async function handleRolloutStatus(ctx: any, res: any) {
+  try {
+    const client = scopedOsClient(ctx);
+    if (!client) {
+      return res.customError({
+        statusCode: 503,
+        body: { message: 'OpenSearch scoped client unavailable.' }
+      });
+    }
+
+    const status = await listRolloutStatus(client);
+    return res.ok({ body: status });
+  } catch (err: any) {
+    return res.customError({
+      statusCode: 500,
+      body: {
+        message: 'Failed to load rollout status.',
+        details: String(err?.message ?? err)
+      }
+    });
+  }
+}
+
+async function handleRolloutRetry(ctx: any, res: any) {
+  try {
+    const client = scopedOsClient(ctx);
+    if (!client) {
+      return res.customError({
+        statusCode: 503,
+        body: { message: 'OpenSearch scoped client unavailable.' }
+      });
+    }
+    const result = await retryRetryableCommands(client);
+    const status = await listRolloutStatus(client);
+    return res.ok({
+      body: {
+        retried: result.retried,
+        status
+      }
+    });
+  } catch (err: any) {
+    return res.customError({
+      statusCode: 500,
+      body: {
+        message: 'Failed to retry rollout failures.',
+        details: String(err?.message ?? err)
+      }
+    });
+  }
+}
+
+async function handleRolloutAck(ctx: any, req: any, res: any) {
+  try {
+    const client = scopedOsClient(ctx);
+    if (!client) {
+      return res.customError({
+        statusCode: 503,
+        body: { message: 'OpenSearch scoped client unavailable.' }
+      });
+    }
+
+    const ackResult = await acknowledgeRollout(client, req.body ?? {});
+    if (!ackResult.updated) {
+      return res.customError({
+        statusCode: 404,
+        body: {
+          message: ackResult.reason ?? 'Rollout command not found for ACK.'
+        }
+      });
+    }
+
+    return res.ok({ body: { acknowledged: true } });
+  } catch (err: any) {
+    return res.customError({
+      statusCode: 500,
+      body: {
+        message: 'Failed to acknowledge rollout command.',
+        details: String(err?.message ?? err)
+      }
+    });
+  }
+}
+
+async function handleRolloutStatusIngestion(ctx: any, req: any, res: any) {
+  try {
+    const client = scopedOsClient(ctx);
+    if (!client) {
+      return res.customError({
+        statusCode: 503,
+        body: { message: 'OpenSearch scoped client unavailable.' }
+      });
+    }
+
+    const ingestion = await ingestYaraRolloutStatusReport(client, req.body ?? {});
+    return res.ok({ body: ingestion });
+  } catch (err: any) {
+    return res.customError({
+      statusCode: 500,
+      body: {
+        message: 'Failed to ingest rollout status report.',
+        details: String(err?.message ?? err)
+      }
+    });
+  }
 }
 
 export function registerYaraRoutes(router: any): void {
@@ -395,37 +614,126 @@ export function registerYaraRoutes(router: any): void {
       validate: false
     },
     async (ctx: any, _req: any, res: any) => {
+      if (forgeCoreSyncInFlight) {
+        const snapshot = syncMetadataSnapshot();
+        return res.ok({
+          body: {
+            status: 'running',
+            started: false,
+            sync_id: forgeCoreSyncMetadata.sync_id,
+            parallel_workers: 0,
+            attempted: snapshot.attempted ?? 0,
+            loaded: snapshot.loaded ?? 0,
+            imported: snapshot.imported ?? 0,
+            unchanged: snapshot.unchanged ?? 0,
+            active_rules_queued: snapshot.active_rules_queued ?? 0,
+            load_failures: snapshot.load_failures ?? 0,
+            rollout: {
+              target_agent_commands: snapshot.rollout?.target_agent_commands ?? 0,
+              created: snapshot.rollout?.created ?? 0,
+              deduplicated: snapshot.rollout?.deduplicated ?? 0,
+              planned_rules: snapshot.rollout?.planned_rules ?? 0,
+              processed_rules: snapshot.rollout?.processed_rules ?? 0
+            },
+            errors: snapshot.errors ?? [],
+            metadata: snapshot
+          }
+        });
+      }
+
+      const startedAt = new Date().toISOString();
+      const syncId = `forge-core-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      forgeCoreSyncInFlight = true;
+      forgeCoreSyncMetadata = {
+        status: 'processing',
+        phase: 'downloading',
+        sync_id: syncId,
+        started_at: startedAt,
+        message: 'YARA Forge Core sync started.',
+        errors: []
+      };
+      updateYaraForgeSyncState({
+        phase: 'downloading',
+        last_attempted_at: startedAt,
+        last_error: undefined,
+        rollout: {
+          target_agent_commands: 0,
+          created: 0,
+          deduplicated: 0,
+          planned_rules: 0,
+          processed_rules: 0
+        }
+      });
+
       try {
-        const sources = await loadForgeCoreSources();
-        const syncResult = await syncForgeCoreWithWorkerPool(sources);
+        const release = await fetchLatestYaraForgeCoreRelease();
+
+        forgeCoreSyncMetadata = {
+          ...forgeCoreSyncMetadata,
+          phase: 'validating',
+          release_tag: release.release_tag,
+          asset_name: release.asset_name,
+          attempted: release.sources.length,
+          loaded: release.sources.length,
+          imported: 0,
+          unchanged: 0,
+          removed: 0,
+          load_failures: 0,
+          active_rules_queued: 0,
+          rollout: {
+            target_agent_commands: 0,
+            created: 0,
+            deduplicated: 0,
+            planned_rules: 0,
+            processed_rules: 0
+          },
+          message: 'Validating YARA Forge Core rules before rollout.'
+        };
+        updateYaraForgeSyncState({
+          phase: 'validating',
+          release_tag: release.release_tag,
+          asset_name: release.asset_name,
+          asset_updated_at: release.asset_updated_at,
+          attempted: release.sources.length,
+          loaded: release.sources.length,
+          imported: 0,
+          unchanged: 0,
+          removed: 0,
+          load_failures: 0,
+          active_rules_queued: 0,
+          rollout: {
+            target_agent_commands: 0,
+            created: 0,
+            deduplicated: 0,
+            planned_rules: 0,
+            processed_rules: 0
+          }
+        });
+
+        // Keep validating observable to polling clients even when processing is fast.
+        await sleep(900);
 
         let imported = 0;
         let unchanged = 0;
+        let removed = 0;
         let activeRulesQueued = 0;
         let totalDispatchTargets = 0;
         let totalDispatchCreated = 0;
         let totalDispatchDeduplicated = 0;
+        let processedRolloutRules = 0;
         const importErrors: string[] = [];
 
-        const sourceById = new Map<string, (typeof sources)[number]>();
-        for (const source of sources) {
-          sourceById.set(source.id, source);
-        }
-
-        for (const item of syncResult.items) {
-          if (!item.ok || !item.content) {
-            importErrors.push(`${item.id}: ${item.error ?? 'load failed'}`);
-            continue;
-          }
-
-          const source = sourceById.get(item.id);
-          const existingState = getExistingForgeCoreRuleState(item.id);
+        const seenRuleIds = new Set<string>();
+        const rolloutCandidates: Array<{ id: string; name: string; updatedAt: string; action: 'activate' | 'deactivate' | 'delete' }> = [];
+        for (const source of release.sources) {
+          seenRuleIds.add(source.id);
+          const existingState = getExistingForgeCoreRuleState(source.id);
           const upserted = upsertForgeCoreYaraRule({
-            id: item.id,
-            name: item.name,
-            content: item.content,
-            severity: source?.severity ?? 'medium',
-            tags: source?.tags ?? ['forge-core', 'synced'],
+            id: source.id,
+            name: source.name,
+            content: source.content,
+            severity: source.severity,
+            tags: source.tags,
             enabled: existingState ? existingState.enabled : true
           });
 
@@ -437,159 +745,310 @@ export function registerYaraRoutes(router: any): void {
 
           if (upserted.rule.enabled) {
             activeRulesQueued += 1;
-            const rollout = await dispatchRuleRollout(
-              ctx,
-              { id: upserted.rule.id, name: upserted.rule.name, updatedAt: upserted.rule.updatedAt },
-              'activate'
-            );
-            if (rollout.queued) {
-              totalDispatchTargets += Number(rollout.agents ?? 0);
-              totalDispatchCreated += Number(rollout.dispatched ?? 0);
-              totalDispatchDeduplicated += Number(rollout.deduplicated ?? 0);
+          }
+
+          // Pre-filter rollout to only changed/new rules; unchanged rules are skipped.
+          if (upserted.changed) {
+            if (upserted.rule.enabled) {
+              rolloutCandidates.push({
+                id: upserted.rule.id,
+                name: upserted.rule.name,
+                updatedAt: upserted.rule.updatedAt,
+                action: 'activate'
+              });
+            } else if (existingState?.enabled) {
+              rolloutCandidates.push({
+                id: upserted.rule.id,
+                name: upserted.rule.name,
+                updatedAt: upserted.rule.updatedAt,
+                action: 'deactivate'
+              });
             }
           }
         }
 
+        const existingForgeRules = listYaraRules().filter((rule) => rule.source === 'forge-core');
+        for (const existingRule of existingForgeRules) {
+          if (seenRuleIds.has(existingRule.id)) {
+            continue;
+          }
+
+          const target = getYaraRule(existingRule.id);
+          const deleted = deleteCustomYaraRule(existingRule.id);
+          if (!deleted.deleted) {
+            importErrors.push(`${existingRule.id}: failed to remove stale Forge rule.`);
+            continue;
+          }
+
+          removed += 1;
+          if (target?.enabled) {
+            rolloutCandidates.push({ id: target.id, name: target.name, updatedAt: target.updatedAt, action: 'delete' });
+          }
+        }
+
+        const plannedRolloutRules = rolloutCandidates.length;
+
+        forgeCoreSyncMetadata = {
+          ...forgeCoreSyncMetadata,
+          phase: 'rollout',
+          attempted: release.sources.length,
+          loaded: release.sources.length,
+          imported,
+          unchanged,
+          removed,
+          load_failures: 0,
+          active_rules_queued: activeRulesQueued,
+          rollout: {
+            target_agent_commands: 0,
+            created: 0,
+            deduplicated: 0,
+            planned_rules: plannedRolloutRules,
+            processed_rules: 0
+          },
+          message: 'Creating rollout commands for validated rules.'
+        };
+        updateYaraForgeSyncState({
+          phase: 'rollout',
+          attempted: release.sources.length,
+          loaded: release.sources.length,
+          imported,
+          unchanged,
+          removed,
+          load_failures: 0,
+          active_rules_queued: activeRulesQueued,
+          rollout: {
+            target_agent_commands: 0,
+            created: 0,
+            deduplicated: 0,
+            planned_rules: plannedRolloutRules,
+            processed_rules: 0
+          }
+        });
+
+        for (const candidate of rolloutCandidates) {
+          const rollout = await dispatchRuleRollout(ctx, candidate, candidate.action);
+          if (!rollout.queued) {
+            processedRolloutRules += 1;
+            const rolloutProgress = {
+              target_agent_commands: totalDispatchTargets,
+              created: totalDispatchCreated,
+              deduplicated: totalDispatchDeduplicated,
+              planned_rules: plannedRolloutRules,
+              processed_rules: processedRolloutRules
+            };
+            forgeCoreSyncMetadata = {
+              ...forgeCoreSyncMetadata,
+              rollout: rolloutProgress
+            };
+            updateYaraForgeSyncState({ rollout: rolloutProgress });
+            continue;
+          }
+          totalDispatchTargets += Number(rollout.agents ?? 0);
+          totalDispatchCreated += Number(rollout.dispatched ?? 0);
+          totalDispatchDeduplicated += Number(rollout.deduplicated ?? 0);
+          processedRolloutRules += 1;
+          const rolloutProgress = {
+            target_agent_commands: totalDispatchTargets,
+            created: totalDispatchCreated,
+            deduplicated: totalDispatchDeduplicated,
+            planned_rules: plannedRolloutRules,
+            processed_rules: processedRolloutRules
+          };
+          forgeCoreSyncMetadata = {
+            ...forgeCoreSyncMetadata,
+            rollout: rolloutProgress
+          };
+          updateYaraForgeSyncState({ rollout: rolloutProgress });
+        }
+
+        const completedAt = new Date().toISOString();
+        updateYaraForgeSyncState({
+          phase: 'completed',
+          release_tag: release.release_tag,
+          asset_name: release.asset_name,
+          asset_updated_at: release.asset_updated_at,
+          last_attempted_at: startedAt,
+          last_completed_at: completedAt,
+          last_successful_sync_at: completedAt,
+          attempted: release.sources.length,
+          loaded: release.sources.length,
+          imported,
+          unchanged,
+          removed,
+          load_failures: 0,
+          active_rules_queued: activeRulesQueued,
+          rollout: {
+            target_agent_commands: totalDispatchTargets,
+            created: totalDispatchCreated,
+            deduplicated: totalDispatchDeduplicated,
+            planned_rules: plannedRolloutRules,
+            processed_rules: processedRolloutRules
+          },
+          last_error: undefined
+        });
+        forgeCoreSyncMetadata = {
+          status: 'completed',
+          phase: 'completed',
+          sync_id: syncId,
+          started_at: startedAt,
+          completed_at: completedAt,
+          synced_at: completedAt,
+          attempted: release.sources.length,
+          loaded: release.sources.length,
+          imported,
+          unchanged,
+          removed,
+          load_failures: 0,
+          active_rules_queued: activeRulesQueued,
+          release_tag: release.release_tag,
+          asset_name: release.asset_name,
+          rollout: {
+            target_agent_commands: totalDispatchTargets,
+            created: totalDispatchCreated,
+            deduplicated: totalDispatchDeduplicated,
+            planned_rules: plannedRolloutRules,
+            processed_rules: processedRolloutRules
+          },
+          message: 'YARA Forge Core sync completed.',
+          errors: importErrors.sort((a, b) => a.localeCompare(b))
+        };
+
         return res.ok({
           body: {
+            status: 'completed',
+            started: true,
+            sync_id: syncId,
             message: 'YARA Forge Core sync completed.',
-            parallel_workers: syncResult.worker_count,
-            attempted: syncResult.attempted,
-            loaded: syncResult.succeeded,
-            load_failures: syncResult.failed,
+            parallel_workers: 1,
+            attempted: release.sources.length,
+            loaded: release.sources.length,
+            load_failures: 0,
             imported,
             unchanged,
+            removed,
             active_rules_queued: activeRulesQueued,
+            release_tag: release.release_tag,
+            asset_name: release.asset_name,
             rollout: {
               target_agent_commands: totalDispatchTargets,
               created: totalDispatchCreated,
-              deduplicated: totalDispatchDeduplicated
+              deduplicated: totalDispatchDeduplicated,
+              planned_rules: plannedRolloutRules,
+              processed_rules: processedRolloutRules
             },
-            errors: importErrors.sort((a, b) => a.localeCompare(b))
+            errors: importErrors.sort((a, b) => a.localeCompare(b)),
+            metadata: syncMetadataSnapshot()
           }
         });
       } catch (err: any) {
+        updateYaraForgeSyncState({
+          phase: 'failed',
+          last_attempted_at: startedAt,
+          last_completed_at: new Date().toISOString(),
+          last_error: String(err?.message ?? err)
+        });
+        forgeCoreSyncMetadata = {
+          status: 'failed',
+          phase: 'failed',
+          sync_id: syncId,
+          started_at: startedAt,
+          completed_at: new Date().toISOString(),
+          message: 'Failed to sync YARA Forge Core.',
+          errors: [String(err?.message ?? err)]
+        };
         return res.customError({
-          statusCode: 500,
+          statusCode: 502,
           body: {
             message: 'Failed to sync YARA Forge Core.',
             details: String(err?.message ?? err)
           }
         });
+      } finally {
+        forgeCoreSyncInFlight = false;
       }
     }
   );
 
   router.get(
     {
-      path: '/api/xdr-defense/yara/rollouts/status',
+      path: '/api/xdr-defense/yara/forge-core/status',
       validate: false
     },
-    async (ctx: any, _req: any, res: any) => {
-      try {
-        const client = scopedOsClient(ctx);
-        if (!client) {
-          return res.customError({
-            statusCode: 503,
-            body: { message: 'OpenSearch scoped client unavailable.' }
-          });
-        }
-
-        const status = await listRolloutStatus(client);
-        return res.ok({ body: status });
-      } catch (err: any) {
-        return res.customError({
-          statusCode: 500,
-          body: {
-            message: 'Failed to load rollout status.',
-            details: String(err?.message ?? err)
-          }
-        });
-      }
+    async (_ctx: any, _req: any, res: any) => {
+      return res.ok({ body: syncMetadataSnapshot() });
     }
   );
 
+  // Current endpoint: /api/xdr-defense/yara/rollouts/status
+  router.get(
+    {
+      path: '/api/xdr-defense/yara/rollouts/status',
+      validate: false
+    },
+    async (ctx: any, _req: any, res: any) => handleRolloutStatus(ctx, res)
+  );
+
+  // Legacy alias: /api/xdr-defense/yara-rollouts/status
+  router.get(
+    {
+      path: '/api/xdr-defense/yara-rollouts/status',
+      validate: false
+    },
+    async (ctx: any, _req: any, res: any) => handleRolloutStatus(ctx, res)
+  );
+
+  // Current endpoint: POST /api/xdr-defense/yara/rollouts/status
+  router.post(
+    {
+      path: '/api/xdr-defense/yara/rollouts/status',
+      validate: rolloutStatusValidationSchema
+    },
+    async (ctx: any, req: any, res: any) => handleRolloutStatusIngestion(ctx, req, res)
+  );
+
+  // Legacy alias: POST /api/xdr-defense/yara-rollouts/status
+  router.post(
+    {
+      path: '/api/xdr-defense/yara-rollouts/status',
+      validate: rolloutStatusValidationSchema
+    },
+    async (ctx: any, req: any, res: any) => handleRolloutStatusIngestion(ctx, req, res)
+  );
+
+  // Current endpoint: /api/xdr-defense/yara/rollouts/retry
   router.post(
     {
       path: '/api/xdr-defense/yara/rollouts/retry',
       validate: false
     },
-    async (ctx: any, _req: any, res: any) => {
-      try {
-        const client = scopedOsClient(ctx);
-        if (!client) {
-          return res.customError({
-            statusCode: 503,
-            body: { message: 'OpenSearch scoped client unavailable.' }
-          });
-        }
-        const result = await retryRetryableCommands(client);
-        const status = await listRolloutStatus(client);
-        return res.ok({
-          body: {
-            retried: result.retried,
-            status
-          }
-        });
-      } catch (err: any) {
-        return res.customError({
-          statusCode: 500,
-          body: {
-            message: 'Failed to retry rollout failures.',
-            details: String(err?.message ?? err)
-          }
-        });
-      }
-    }
+    async (ctx: any, _req: any, res: any) => handleRolloutRetry(ctx, res)
   );
 
+  // Legacy alias: /api/xdr-defense/yara-rollouts/retry
+  router.post(
+    {
+      path: '/api/xdr-defense/yara-rollouts/retry',
+      validate: false
+    },
+    async (ctx: any, _req: any, res: any) => handleRolloutRetry(ctx, res)
+  );
+
+  // Current endpoint: /api/xdr-defense/yara/rollouts/ack
   router.post(
     {
       path: '/api/xdr-defense/yara/rollouts/ack',
-      validate: {
-        body: schema.object({
-          command_id: schema.maybe(schema.string({ minLength: 1, maxLength: 128 })),
-          command_key: schema.maybe(schema.string({ minLength: 1, maxLength: 512 })),
-          agent_id: schema.string({ minLength: 1, maxLength: 256 }),
-          rule_id: schema.maybe(schema.string({ minLength: 1, maxLength: 256 })),
-          action: schema.maybe(schema.oneOf([schema.literal('activate'), schema.literal('deactivate'), schema.literal('delete')])),
-          dispatch_version: schema.maybe(schema.string({ minLength: 1, maxLength: 128 })),
-          status: schema.oneOf([schema.literal('acknowledged'), schema.literal('failed')]),
-          reason: schema.maybe(schema.string({ minLength: 1, maxLength: 2048 }))
-        })
-      }
+      validate: ackValidationSchema
     },
-    async (ctx: any, req: any, res: any) => {
-      try {
-        const client = scopedOsClient(ctx);
-        if (!client) {
-          return res.customError({
-            statusCode: 503,
-            body: { message: 'OpenSearch scoped client unavailable.' }
-          });
-        }
+    async (ctx: any, req: any, res: any) => handleRolloutAck(ctx, req, res)
+  );
 
-        const ackResult = await acknowledgeRollout(client, req.body ?? {});
-        if (!ackResult.updated) {
-          return res.customError({
-            statusCode: 404,
-            body: {
-              message: ackResult.reason ?? 'Rollout command not found for ACK.'
-            }
-          });
-        }
-
-        return res.ok({ body: { acknowledged: true } });
-      } catch (err: any) {
-        return res.customError({
-          statusCode: 500,
-          body: {
-            message: 'Failed to acknowledge rollout command.',
-            details: String(err?.message ?? err)
-          }
-        });
-      }
-    }
+  // Legacy alias: /api/xdr-defense/yara-rollouts/ack
+  router.post(
+    {
+      path: '/api/xdr-defense/yara-rollouts/ack',
+      validate: ackValidationSchema
+    },
+    async (ctx: any, req: any, res: any) => handleRolloutAck(ctx, req, res)
   );
 
   // POST /api/xdr-defense/yara-rules/inventory/query

@@ -51,9 +51,35 @@ export interface RolloutStatusResponse {
   rules: Record<string, RuleRolloutSummary>;
 }
 
+export interface RuleActivationStatusReport {
+  rule_id: string;
+  status: string;
+  error_message?: string;
+  loaded_at?: number;
+}
+
+export interface YaraRolloutStatusReport {
+  manager_policy_id: string;
+  agent_id: string;
+  state: 'acked' | 'partial' | 'failed';
+  total_rules: number;
+  loaded_rules: number;
+  failed_rules: RuleActivationStatusReport[];
+  reported_at: number;
+}
+
+export interface YaraRolloutStatusIngestResult {
+  accepted: boolean;
+  updated_commands: number;
+  matched_commands: number;
+  failed_rules: number;
+  stored_index: string;
+}
+
 const ROLLOUT_INDEX = 'xdr-defense-yara-rollouts';
 const AGENT_INDEX = 'xdr-agents';
 const STALE_PENDING_MINUTES = 10;
+const RULE_HEALTH_INDEX_PREFIX = '.xdr-defense-rule-health';
 
 function nowIso(): string {
   return new Date().toISOString();
@@ -73,6 +99,30 @@ function parseDate(input?: string): number {
   }
   const ms = Date.parse(input);
   return Number.isFinite(ms) ? ms : 0;
+}
+
+function fromUnixTimestamp(input: number): string {
+  const numeric = Number(input);
+  if (!Number.isFinite(numeric) || numeric <= 0) {
+    return nowIso();
+  }
+
+  // Agent payload currently sends Unix seconds; tolerate milliseconds too.
+  const ms = numeric > 1_000_000_000_000 ? numeric : numeric * 1000;
+  const parsed = new Date(ms);
+  if (Number.isNaN(parsed.getTime())) {
+    return nowIso();
+  }
+  return parsed.toISOString();
+}
+
+function ruleHealthIndexFor(reportedAtIso: string): string {
+  const datePart = reportedAtIso.slice(0, 10).replace(/-/g, '.');
+  if (!datePart || datePart.length !== 10) {
+    const nowPart = nowIso().slice(0, 10).replace(/-/g, '.');
+    return `${RULE_HEALTH_INDEX_PREFIX}-${nowPart}`;
+  }
+  return `${RULE_HEALTH_INDEX_PREFIX}-${datePart}`;
 }
 
 function recordRecency(record: RolloutCommandRecord): number {
@@ -443,4 +493,101 @@ export async function acknowledgeRollout(
   } catch (_err) {
     return { updated: false, reason: 'Command not found for ACK.' };
   }
+}
+
+export async function ingestYaraRolloutStatusReport(
+  client: any,
+  report: YaraRolloutStatusReport
+): Promise<YaraRolloutStatusIngestResult> {
+  await ensureRolloutIndex(client);
+
+  const failedByRule = new Map<string, string>();
+  for (const failedRule of report.failed_rules ?? []) {
+    const ruleId = String(failedRule?.rule_id ?? '').trim();
+    if (!ruleId) {
+      continue;
+    }
+    const reason = String(failedRule?.error_message ?? '').trim() || 'agent reported failed rule activation';
+    failedByRule.set(ruleId, reason);
+  }
+
+  let hits: any[] = [];
+  try {
+    const response = await client.search({
+      index: ROLLOUT_INDEX,
+      size: 1000,
+      sort: ['last_dispatched_at:desc'],
+      body: {
+        query: {
+          term: {
+            agent_id: report.agent_id
+          }
+        }
+      }
+    });
+    hits = Array.isArray(response?.body?.hits?.hits) ? response.body.hits.hits : [];
+  } catch (_err) {
+    hits = [];
+  }
+
+  const mapped = hits.map((hit) => mapHit(hit)).filter((entry): entry is RolloutCommandRecord => entry !== null);
+  const latestByRule = collapseToLatestState(mapped);
+
+  let updatedCommands = 0;
+  for (const record of latestByRule) {
+    const reason = failedByRule.get(record.rule_id);
+    const targetStatus = reason ? 'failed' : 'acknowledged';
+
+    try {
+      await client.update({
+        index: ROLLOUT_INDEX,
+        id: record.command_id,
+        refresh: 'wait_for',
+        body: {
+          script: {
+            source:
+              'ctx._source.status = params.status; ' +
+              'ctx._source.acknowledged_at = params.now; ' +
+              'ctx._source.failure_reason = params.reason;',
+            params: {
+              status: targetStatus,
+              now: nowIso(),
+              reason
+            }
+          }
+        }
+      });
+      updatedCommands += 1;
+    } catch (_err) {
+      // If a command disappears between search and update, continue processing.
+    }
+  }
+
+  const reportedAtIso = fromUnixTimestamp(report.reported_at);
+  const ruleHealthIndex = ruleHealthIndexFor(reportedAtIso);
+  await client.index({
+    index: ruleHealthIndex,
+    refresh: 'wait_for',
+    body: {
+      '@timestamp': reportedAtIso,
+      kind: 'yara_rollout_status',
+      manager_policy_id: report.manager_policy_id,
+      agent_id: report.agent_id,
+      state: report.state,
+      total_rules: report.total_rules,
+      loaded_rules: report.loaded_rules,
+      failed_rules: report.failed_rules ?? [],
+      failed_rule_count: (report.failed_rules ?? []).length,
+      reported_at: report.reported_at,
+      ingest_time: nowIso()
+    }
+  });
+
+  return {
+    accepted: true,
+    updated_commands: updatedCommands,
+    matched_commands: latestByRule.length,
+    failed_rules: failedByRule.size,
+    stored_index: ruleHealthIndex
+  };
 }

@@ -116,6 +116,31 @@ function fromUnixTimestamp(input: number): string {
   return parsed.toISOString();
 }
 
+export function ruleHealthTimestamp(input: unknown): string {
+  if (typeof input === 'number') {
+    return fromUnixTimestamp(input);
+  }
+
+  if (typeof input === 'string') {
+    const trimmed = input.trim();
+    if (!trimmed) {
+      return nowIso();
+    }
+
+    const numeric = Number(trimmed);
+    if (Number.isFinite(numeric)) {
+      return fromUnixTimestamp(numeric);
+    }
+
+    const parsed = new Date(trimmed);
+    if (!Number.isNaN(parsed.getTime())) {
+      return parsed.toISOString();
+    }
+  }
+
+  return nowIso();
+}
+
 function ruleHealthIndexFor(reportedAtIso: string): string {
   const datePart = reportedAtIso.slice(0, 10).replace(/-/g, '.');
   if (!datePart || datePart.length !== 10) {
@@ -123,6 +148,10 @@ function ruleHealthIndexFor(reportedAtIso: string): string {
     return `${RULE_HEALTH_INDEX_PREFIX}-${nowPart}`;
   }
   return `${RULE_HEALTH_INDEX_PREFIX}-${datePart}`;
+}
+
+export function ruleHealthIndexForTimestamp(input: unknown): string {
+  return ruleHealthIndexFor(ruleHealthTimestamp(input));
 }
 
 function recordRecency(record: RolloutCommandRecord): number {
@@ -563,8 +592,8 @@ export async function ingestYaraRolloutStatusReport(
     }
   }
 
-  const reportedAtIso = fromUnixTimestamp(report.reported_at);
-  const ruleHealthIndex = ruleHealthIndexFor(reportedAtIso);
+  const reportedAtIso = ruleHealthTimestamp(report.reported_at);
+  const ruleHealthIndex = ruleHealthIndexForTimestamp(report.reported_at);
   await client.index({
     index: ruleHealthIndex,
     refresh: 'wait_for',

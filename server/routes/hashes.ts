@@ -1,119 +1,868 @@
 declare const require: any;
 
+const crypto = require('crypto');
+const BufferCtor = (globalThis as any).Buffer;
+
 import {
-  addCustomHashRule,
-  buildSignedHashBundle,
-  deleteHashRule,
-  getExistingMalwareBazaarHashRuleState,
-  getHashRule,
-  getHashSigningReadiness,
-  listHashRules,
-  updateHashRule,
-  upsertMalwareBazaarHashRule
-} from '../lib/hashes_store';
-import { fetchMalwareBazaarHashes } from '../lib/malwarebazaar';
+  HASHES_INDEX_NAME,
+  bulkUpsertHashDocuments,
+  customDocId,
+  deleteHashDocument,
+  ensureHashesIndex,
+  getHashDocument,
+  listBundleCandidates,
+  listHashRulesIndexed,
+  malwareBazaarDocId,
+  upsertHashDocument,
+  type HashIndexDocument
+} from '../lib/hashes_index';
+import {
+  fetchMalwareBazaarHashes,
+  syncMalwareBazaarDailyFullCsv,
+  type MalwareBazaarSample
+} from '../lib/malwarebazaar';
 import { getMalwareBazaarApiKey, getMalwareBazaarApiKeyStatus, setMalwareBazaarApiKey } from '../lib/secret_store';
+import { getSigningPrivateKey } from '../lib/signing_keys';
 import { getMalwareBazaarSyncState, updateMalwareBazaarSyncState } from '../lib/upstream_sync_store';
+import { validateHashContent } from '../lib/hashes_store';
 
 const { schema } = require('@osd/config-schema');
 
-const MALWARE_BAZAAR_RULE_ID = 'malwarebazaar-recent-feed';
-const MALWARE_BAZAAR_RULE_NAME = 'MalwareBazaar Recent Malicious Hash Feed';
-const MALWARE_BAZAAR_MAX_HASHES = 5000;
+type MalwareBazaarSyncStatus = 'idle' | 'processing' | 'completed' | 'failed';
+type MalwareBazaarSyncPhase =
+  | 'idle'
+  | 'requesting_export'
+  | 'preparing_download'
+  | 'downloading'
+  | 'importing'
+  | 'completed'
+  | 'failed';
+type MalwareBazaarSyncMode = 'malwarebazaar_api' | 'daily_full_csv';
 
-function parseSha256Set(content: string): Set<string> {
-  const hashes = new Set<string>();
-  for (const line of String(content ?? '').split(/\r?\n/)) {
-    const normalized = line.trim().toLowerCase();
-    const match = normalized.match(/^sha256:([a-f0-9]{64})$/) ?? normalized.match(/^([a-f0-9]{64})$/);
-    if (match) {
-      hashes.add(match[1]);
-    }
+interface MalwareBazaarSyncMetadata {
+  status: MalwareBazaarSyncStatus;
+  phase?: MalwareBazaarSyncPhase;
+  started_at?: string;
+  completed_at?: string;
+  synced_at?: string;
+  query_mode?: string;
+  upstream_records?: number;
+  new_hashes?: number;
+  total_hashes?: number;
+  attempted?: number;
+  imported?: number;
+  unchanged?: number;
+  load_failures?: number;
+  mode?: MalwareBazaarSyncMode;
+  message?: string;
+  errors?: string[];
+}
+
+interface BundleRuleEntry {
+  id: string;
+  filename: string;
+  content: string;
+  sha256: string;
+  enabled: boolean;
+  source: string;
+  updatedAt: string;
+}
+
+interface SignedBundleResponse {
+  manifest_version: 1;
+  policy_id: string;
+  bundle_version: number;
+  generated_at: string;
+  signing_alg: 'ed25519';
+  rules: BundleRuleEntry[];
+  active_checksums: string[];
+  signature_base64: string;
+  signed_payload_base64: string;
+}
+
+type Severity = 'critical' | 'high' | 'medium' | 'low';
+
+const MALWAREBAZAAR_DEFAULT_RECENT_LIMIT = 100;
+
+const bundleStateByPolicy = new Map<string, { bundle_version: number; generated_at: string; content_digest: string }>();
+
+let malwareBazaarSyncInFlight = false;
+let malwareBazaarSyncMetadata: MalwareBazaarSyncMetadata = { status: 'idle' };
+
+function nowIso(): string {
+  return new Date().toISOString();
+}
+
+function formatMb(bytes: number): string {
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function scopedOsClient(ctx: any): any | null {
+  if (typeof ctx?.core?.opensearch?.client?.asInternalUser?.search === 'function') {
+    return ctx.core.opensearch.client.asInternalUser;
   }
-  return hashes;
+  if (typeof ctx?.opensearch?.client?.asInternalUser?.search === 'function') {
+    return ctx.opensearch.client.asInternalUser;
+  }
+  if (typeof ctx?.core?.opensearch?.client?.asCurrentUser?.search === 'function') {
+    return ctx.core.opensearch.client.asCurrentUser;
+  }
+  if (typeof ctx?.opensearch?.client?.asCurrentUser?.search === 'function') {
+    return ctx.opensearch.client.asCurrentUser;
+  }
+  return null;
 }
 
-function buildHashFeedContent(hashes: string[]): string {
-  return hashes.map((hash) => `sha256:${hash}`).join('\n');
-}
+function persistedMalwareBazaarSnapshot(): MalwareBazaarSyncMetadata {
+  const persisted = getMalwareBazaarSyncState();
+  if (!persisted.last_attempted_at) {
+    return { status: 'idle' };
+  }
 
-function malwareBazaarStatusBody(): Record<string, unknown> {
-  const sync = getMalwareBazaarSyncState();
-  const secretStatus = getMalwareBazaarApiKeyStatus();
+  const persistedStatus = !malwareBazaarSyncInFlight && persisted.status === 'processing'
+    ? persisted.last_error
+      ? 'failed'
+      : persisted.last_completed_at
+        ? 'completed'
+        : 'idle'
+    : persisted.status;
+  const persistedPhase = !malwareBazaarSyncInFlight && persisted.status === 'processing'
+    ? persisted.last_error
+      ? 'failed'
+      : persisted.last_completed_at
+        ? 'completed'
+        : 'idle'
+    : persisted.phase;
+  const failed = Boolean(persisted.last_error);
   return {
-    api_key_configured: secretStatus.configured,
-    api_key_updated_at: secretStatus.updated_at ?? sync.api_key_updated_at,
-    last_attempted_at: sync.last_attempted_at,
-    last_completed_at: sync.last_completed_at,
-    last_successful_sync_at: sync.last_successful_sync_at,
-    last_cursor_seen_at: sync.last_cursor_seen_at,
-    last_query_mode: sync.last_query_mode,
-    last_upstream_records: sync.last_upstream_records,
-    last_new_hashes: sync.last_new_hashes,
-    last_total_hashes: sync.last_total_hashes,
-    last_error: sync.last_error
+    status: failed ? 'failed' : persistedStatus ?? 'completed',
+    phase: failed ? 'failed' : persistedPhase ?? 'completed',
+    started_at: persisted.last_attempted_at,
+    completed_at: persisted.last_completed_at,
+    synced_at: persisted.last_successful_sync_at,
+    query_mode: persisted.last_query_mode,
+    upstream_records: persisted.last_upstream_records,
+    new_hashes: persisted.last_new_hashes,
+    total_hashes: persisted.last_total_hashes,
+    attempted: persisted.last_upstream_records,
+    imported: persisted.imported,
+    unchanged: persisted.unchanged,
+    load_failures: persisted.load_failures,
+    mode: persisted.last_query_mode === 'daily_full_csv_export' ? 'daily_full_csv' : 'malwarebazaar_api',
+    message: persisted.message,
+    errors: failed && persisted.last_error ? [persisted.last_error] : []
   };
 }
 
-async function performMalwareBazaarSync(): Promise<Record<string, unknown>> {
+function malwareBazaarSnapshot(): MalwareBazaarSyncMetadata {
+  if (malwareBazaarSyncMetadata.status === 'idle') {
+    return persistedMalwareBazaarSnapshot();
+  }
+
+  return {
+    ...malwareBazaarSyncMetadata,
+    errors: [...(malwareBazaarSyncMetadata.errors ?? [])]
+  };
+}
+
+function malwareBazaarStatusBody(): Record<string, unknown> {
+  const runtime = malwareBazaarSnapshot();
+  const sync = getMalwareBazaarSyncState();
+  const secretStatus = getMalwareBazaarApiKeyStatus();
+  return {
+    status: runtime.status,
+    phase: runtime.phase,
+    mode: runtime.mode,
+    message: runtime.message,
+    attempted: runtime.attempted,
+    imported: runtime.imported,
+    unchanged: runtime.unchanged,
+    load_failures: runtime.load_failures,
+    api_key_configured: secretStatus.configured,
+    api_key_updated_at: secretStatus.updated_at ?? sync.api_key_updated_at,
+    last_attempted_at: runtime.started_at ?? sync.last_attempted_at,
+    last_completed_at: runtime.completed_at ?? sync.last_completed_at,
+    last_successful_sync_at: runtime.synced_at ?? sync.last_successful_sync_at,
+    last_cursor_seen_at: sync.last_cursor_seen_at,
+    last_query_mode: runtime.query_mode ?? sync.last_query_mode,
+    last_upstream_records: runtime.upstream_records ?? sync.last_upstream_records,
+    last_new_hashes: runtime.new_hashes ?? sync.last_new_hashes,
+    last_total_hashes: runtime.total_hashes ?? sync.last_total_hashes,
+    last_error: runtime.status === 'failed' ? runtime.errors?.[0] : sync.last_error,
+    pull_limit: MALWAREBAZAAR_DEFAULT_RECENT_LIMIT,
+    backing_index: HASHES_INDEX_NAME
+  };
+}
+
+function syncAlreadyRunningResponse(res: any, requestedMode: MalwareBazaarSyncMode) {
+  const snapshot = malwareBazaarSnapshot();
+  return res.customError({
+    statusCode: 409,
+    body: {
+      message: 'A MalwareBazaar hash sync is already running.',
+      started: false,
+      requested_mode: requestedMode,
+      running_mode: snapshot.mode,
+      query_mode: snapshot.query_mode,
+      attempted: snapshot.attempted ?? 0,
+      upstream_records: snapshot.upstream_records ?? 0,
+      new_hashes: snapshot.new_hashes ?? 0,
+      total_hashes: snapshot.total_hashes ?? 0,
+      imported: snapshot.imported ?? 0,
+      unchanged: snapshot.unchanged ?? 0,
+      load_failures: snapshot.load_failures ?? 0,
+      errors: snapshot.errors ?? [],
+      metadata: snapshot
+    }
+  });
+}
+
+function cleanString(raw: unknown): string | undefined {
+  const value = String(raw ?? '').trim();
+  if (!value || value.toLowerCase() === 'n/a' || value.toLowerCase() === 'none' || value === '-') {
+    return undefined;
+  }
+  return value;
+}
+
+function normalizeHash(raw: unknown, length: number): string | undefined {
+  const value = String(raw ?? '').trim().toLowerCase();
+  const re = new RegExp(`^[a-f0-9]{${length}}$`);
+  return re.test(value) ? value : undefined;
+}
+
+function normalizeSeverity(raw: unknown): Severity {
+  const value = String(raw ?? '').trim().toLowerCase();
+  if (value === 'critical' || value === 'crit') {
+    return 'critical';
+  }
+  if (value === 'high') {
+    return 'high';
+  }
+  if (value === 'low') {
+    return 'low';
+  }
+  return 'medium';
+}
+
+function shouldExportSeverity(raw: unknown): boolean {
+  const severity = normalizeSeverity(raw);
+  return severity === 'critical' || severity === 'high';
+}
+
+function severityRank(severity: Severity): number {
+  switch (severity) {
+    case 'critical':
+      return 4;
+    case 'high':
+      return 3;
+    case 'medium':
+      return 2;
+    default:
+      return 1;
+  }
+}
+
+function parseVtPercent(raw: unknown): number | undefined {
+  const cleaned = String(raw ?? '').trim().replace('%', '');
+  if (!cleaned) {
+    return undefined;
+  }
+
+  const numerator = cleaned.split('/')[0];
+  const value = Number.parseFloat(numerator);
+  if (!Number.isFinite(value)) {
+    return undefined;
+  }
+  return Math.max(0, Math.min(100, value));
+}
+
+function deriveMalwareBazaarSeverity(sample: MalwareBazaarSample): Severity {
+  let derived: Severity = 'low';
+  const vtpercent = parseVtPercent(sample.vtpercent);
+  if (typeof vtpercent === 'number') {
+    if (vtpercent >= 60) {
+      derived = 'critical';
+    } else if (vtpercent >= 25) {
+      derived = 'high';
+    } else if (vtpercent >= 5) {
+      derived = 'medium';
+    }
+  }
+
+  const signature = String(sample.signature ?? '').toLowerCase();
+  const criticalKeywords = ['ransom', 'wiper', 'rootkit'];
+  const highKeywords = ['stealer', 'banker', 'backdoor', 'botnet', 'worm', 'trojan'];
+
+  if (criticalKeywords.some((keyword) => signature.includes(keyword))) {
+    return severityRank(derived) >= severityRank('critical') ? derived : 'critical';
+  }
+  if (highKeywords.some((keyword) => signature.includes(keyword))) {
+    return severityRank(derived) >= severityRank('high') ? derived : 'high';
+  }
+
+  return derived;
+}
+
+function toDocument(input: {
+  sha256: string;
+  source: HashIndexDocument['source'];
+  sample: MalwareBazaarSample;
+}): HashIndexDocument {
+  const computedTags = [
+    'malwarebazaar',
+    input.source === 'malwarebazaar_full_csv' ? 'full-csv' : 'api-synced',
+    ...(Array.isArray(input.sample.tags) ? input.sample.tags : [])
+  ]
+    .map((entry) => String(entry).trim())
+    .filter((entry) => entry.length > 0);
+
+  const tags = Array.from(new Set(computedTags)).slice(0, 32);
+  const signature = cleanString(input.sample.signature);
+
+  return {
+    first_seen_utc: cleanString(input.sample.first_seen),
+    sha256_hash: input.sha256,
+    md5_hash: normalizeHash(input.sample.md5_hash, 32),
+    sha1_hash: normalizeHash(input.sample.sha1_hash, 40),
+    reporter: cleanString(input.sample.reporter),
+    file_name: cleanString(input.sample.file_name),
+    file_type_guess: cleanString(input.sample.file_type_guess),
+    mime_type: cleanString(input.sample.mime_type),
+    signature,
+    clamav: cleanString(input.sample.clamav),
+    vtpercent: cleanString(input.sample.vtpercent),
+    imphash: normalizeHash(input.sample.imphash, 32),
+    ssdeep: cleanString(input.sample.ssdeep),
+    tlsh: cleanString(input.sample.tlsh),
+    source: input.source,
+    updated_at: nowIso(),
+    name: signature ? `MalwareBazaar ${signature}` : `MalwareBazaar SHA256 ${input.sha256.slice(0, 12)}`,
+    enabled: true,
+    severity: deriveMalwareBazaarSeverity(input.sample),
+    tags,
+    content: `sha256:${input.sha256}`,
+    validation: {
+      status: 'valid',
+      errors: [],
+      warnings: [],
+      checkedAt: nowIso()
+    }
+  };
+}
+
+function toUpdateDocument(doc: HashIndexDocument): Partial<HashIndexDocument> {
+  // Keep operator-managed fields (enabled/tags) untouched for existing docs.
+  return {
+    first_seen_utc: doc.first_seen_utc,
+    sha256_hash: doc.sha256_hash,
+    md5_hash: doc.md5_hash,
+    sha1_hash: doc.sha1_hash,
+    reporter: doc.reporter,
+    file_name: doc.file_name,
+    file_type_guess: doc.file_type_guess,
+    mime_type: doc.mime_type,
+    signature: doc.signature,
+    clamav: doc.clamav,
+    vtpercent: doc.vtpercent,
+    imphash: doc.imphash,
+    ssdeep: doc.ssdeep,
+    tlsh: doc.tlsh,
+    source: doc.source,
+    updated_at: doc.updated_at,
+    name: doc.name,
+    severity: doc.severity,
+    content: doc.content,
+    validation: doc.validation
+  };
+}
+
+async function countIndexedHashes(client: any): Promise<number> {
+  await ensureHashesIndex(client);
+  const response = await client.count({
+    index: HASHES_INDEX_NAME,
+    body: { query: { match_all: {} } }
+  });
+  return Number(response?.body?.count ?? 0);
+}
+
+async function ingestMalwareBazaarRows(input: {
+  client: any;
+  samples: MalwareBazaarSample[];
+  mode: MalwareBazaarSyncMode;
+  includeTotalHashes?: boolean;
+}): Promise<{ attempted: number; imported: number; unchanged: number; load_failures: number; new_hashes: number; total_hashes?: number }> {
+  const source: HashIndexDocument['source'] = input.mode === 'daily_full_csv' ? 'malwarebazaar_full_csv' : 'malwarebazaar_api';
+
+  const bulkItems: Array<{ id: string; doc: Partial<HashIndexDocument>; upsert: HashIndexDocument }> = [];
+  let loadFailures = 0;
+
+  for (const sample of input.samples) {
+    const sha256 = normalizeHash(sample.sha256_hash, 64);
+    if (!sha256) {
+      loadFailures += 1;
+      continue;
+    }
+
+    const id = malwareBazaarDocId(sha256);
+    const fullDoc = toDocument({ sha256, source, sample });
+    bulkItems.push({
+      id,
+      doc: toUpdateDocument(fullDoc),
+      upsert: fullDoc
+    });
+  }
+
+  const bulkResult = await bulkUpsertHashDocuments(input.client, bulkItems, { refresh: false });
+  const imported = bulkResult.created + bulkResult.updated;
+  const unchanged = bulkResult.noop;
+  loadFailures += bulkResult.failed;
+  const totalHashes = input.includeTotalHashes ? await countIndexedHashes(input.client) : undefined;
+
+  return {
+    attempted: input.samples.length,
+    imported,
+    unchanged,
+    load_failures: loadFailures,
+    new_hashes: bulkResult.created,
+    total_hashes: totalHashes
+  };
+}
+
+async function performMalwareBazaarSync(client: any): Promise<Record<string, unknown>> {
   const apiKey = getMalwareBazaarApiKey();
   if (!apiKey) {
     throw new Error('Configure a MalwareBazaar API key before syncing hashes.');
   }
 
-  const syncState = getMalwareBazaarSyncState();
-  const startedAt = new Date().toISOString();
+  const startedAt = nowIso();
+  malwareBazaarSyncMetadata = {
+    status: 'processing',
+    phase: 'downloading',
+    started_at: startedAt,
+    mode: 'malwarebazaar_api',
+    message: 'Downloading malware hashes from MalwareBazaar API.',
+    attempted: 0,
+    imported: 0,
+    unchanged: 0,
+    load_failures: 0,
+    errors: []
+  };
+  updateMalwareBazaarSyncState({
+    status: 'processing',
+    phase: 'downloading',
+    message: malwareBazaarSyncMetadata.message,
+    imported: 0,
+    unchanged: 0,
+    load_failures: 0,
+    last_attempted_at: startedAt,
+    last_error: undefined
+  });
+
   const feed = await fetchMalwareBazaarHashes({
     apiKey,
-    lastSuccessfulSyncAt: syncState.last_successful_sync_at
+    recentLimit: MALWAREBAZAAR_DEFAULT_RECENT_LIMIT
   });
 
-  const existing = getHashRule(MALWARE_BAZAAR_RULE_ID);
-  const mergedHashes = parseSha256Set(existing?.content ?? '');
-  let newHashes = 0;
-  for (const sample of feed.samples) {
-    if (!mergedHashes.has(sample.sha256_hash)) {
-      mergedHashes.add(sample.sha256_hash);
-      newHashes += 1;
-    }
-  }
+  malwareBazaarSyncMetadata = {
+    ...malwareBazaarSyncMetadata,
+    phase: 'importing',
+    query_mode: feed.query_mode,
+    upstream_records: feed.samples.length,
+    attempted: feed.samples.length,
+    message: `Importing ${feed.samples.length} hashes into ${HASHES_INDEX_NAME} (${feed.query_mode}).`
+  };
 
-  const sortedHashes = [...mergedHashes].sort((a, b) => a.localeCompare(b)).slice(-MALWARE_BAZAAR_MAX_HASHES);
-  const content = buildHashFeedContent(sortedHashes);
-  const existingState = getExistingMalwareBazaarHashRuleState(MALWARE_BAZAAR_RULE_ID);
-  const upserted = upsertMalwareBazaarHashRule({
-    id: MALWARE_BAZAAR_RULE_ID,
-    name: MALWARE_BAZAAR_RULE_NAME,
-    content,
-    severity: 'critical',
-    tags: ['malwarebazaar', 'recent', 'api-synced'],
-    enabled: existingState ? existingState.enabled : true
-  });
-
-  const completedAt = new Date().toISOString();
   updateMalwareBazaarSyncState({
+    status: 'processing',
+    phase: 'importing',
+    message: malwareBazaarSyncMetadata.message,
+    last_query_mode: feed.query_mode,
+    last_upstream_records: feed.samples.length
+  });
+
+  const counters = await ingestMalwareBazaarRows({
+    client,
+    samples: feed.samples,
+    mode: 'malwarebazaar_api',
+    includeTotalHashes: true
+  });
+
+  const completedAt = nowIso();
+  malwareBazaarSyncMetadata = {
+    status: 'completed',
+    phase: 'completed',
+    started_at: startedAt,
+    completed_at: completedAt,
+    synced_at: completedAt,
+    mode: 'malwarebazaar_api',
+    query_mode: feed.query_mode,
+    upstream_records: feed.samples.length,
+    attempted: counters.attempted,
+    new_hashes: counters.new_hashes,
+    total_hashes: counters.total_hashes,
+    imported: counters.imported,
+    unchanged: counters.unchanged,
+    load_failures: counters.load_failures,
+    message: 'MalwareBazaar hash API sync completed.',
+    errors: []
+  };
+
+  updateMalwareBazaarSyncState({
+    status: 'completed',
+    phase: 'completed',
+    message: malwareBazaarSyncMetadata.message,
     last_attempted_at: startedAt,
     last_completed_at: completedAt,
     last_successful_sync_at: completedAt,
     last_cursor_seen_at: feed.cursor_seen_at,
     last_query_mode: feed.query_mode,
     last_upstream_records: feed.samples.length,
-    last_new_hashes: newHashes,
-    last_total_hashes: sortedHashes.length,
+    last_new_hashes: counters.new_hashes,
+    last_total_hashes: counters.total_hashes,
+    imported: counters.imported,
+    unchanged: counters.unchanged,
+    load_failures: counters.load_failures,
     last_error: undefined
   });
 
   return {
     message: 'MalwareBazaar hash sync completed.',
+    mode: 'malwarebazaar_api',
     query_mode: feed.query_mode,
     upstream_records: feed.samples.length,
-    new_hashes: newHashes,
-    total_hashes: sortedHashes.length,
-    imported: upserted.changed ? 1 : 0,
-    unchanged: upserted.changed ? 0 : 1,
-    load_failures: 0,
+    attempted: counters.attempted,
+    new_hashes: counters.new_hashes,
+    total_hashes: counters.total_hashes,
+    imported: counters.imported,
+    unchanged: counters.unchanged,
+    load_failures: counters.load_failures,
     errors: [],
     status: malwareBazaarStatusBody()
+  };
+}
+
+async function performMalwareBazaarDailyFullSync(client: any): Promise<Record<string, unknown>> {
+  const apiKey = getMalwareBazaarApiKey() ?? undefined;
+
+  const startedAt = nowIso();
+
+  malwareBazaarSyncMetadata = {
+    status: 'processing',
+    phase: 'requesting_export',
+    started_at: startedAt,
+    mode: 'daily_full_csv',
+    query_mode: 'daily_full_csv_export',
+    message: 'Requesting MalwareBazaar daily full export.',
+    attempted: 0,
+    imported: 0,
+    unchanged: 0,
+    load_failures: 0,
+    errors: []
+  };
+
+  updateMalwareBazaarSyncState({
+    status: 'processing',
+    phase: 'requesting_export',
+    message: malwareBazaarSyncMetadata.message,
+    last_query_mode: 'daily_full_csv_export',
+    imported: 0,
+    unchanged: 0,
+    load_failures: 0,
+    last_attempted_at: startedAt,
+    last_error: undefined
+  });
+
+  const counters = {
+    attempted: 0,
+    imported: 0,
+    unchanged: 0,
+    load_failures: 0,
+    new_hashes: 0,
+    total_hashes: 0
+  };
+
+  const feed = await syncMalwareBazaarDailyFullCsv({
+    apiKey,
+    batchSize: 5000,
+    onPhase: (phaseMessage) => {
+      const lower = String(phaseMessage).toLowerCase();
+      const phase: MalwareBazaarSyncPhase =
+        lower.includes('request') ? 'requesting_export' : lower.includes('prepar') ? 'preparing_download' : 'downloading';
+      malwareBazaarSyncMetadata = {
+        ...malwareBazaarSyncMetadata,
+        status: 'processing',
+        phase,
+        message: phaseMessage
+      };
+      updateMalwareBazaarSyncState({
+        status: 'processing',
+        phase,
+        message: phaseMessage
+      });
+    },
+    onProgress: (downloadedBytes, totalBytes) => {
+      const progress = totalBytes
+        ? `Downloading ${formatMb(downloadedBytes)} / ${formatMb(totalBytes)}`
+        : `Downloading ${formatMb(downloadedBytes)}`;
+      malwareBazaarSyncMetadata = {
+        ...malwareBazaarSyncMetadata,
+        status: 'processing',
+        phase: 'downloading',
+        message: progress
+      };
+      updateMalwareBazaarSyncState({
+        status: 'processing',
+        phase: 'downloading',
+        message: progress
+      });
+    },
+    onBatch: async (rows: MalwareBazaarSample[]) => {
+      if (rows.length === 0) {
+        return;
+      }
+
+      const batchResult = await ingestMalwareBazaarRows({
+        client,
+        samples: rows,
+        mode: 'daily_full_csv',
+        includeTotalHashes: false
+      });
+
+      counters.attempted += batchResult.attempted;
+      counters.imported += batchResult.imported;
+      counters.unchanged += batchResult.unchanged;
+      counters.load_failures += batchResult.load_failures;
+      counters.new_hashes += batchResult.new_hashes;
+
+      malwareBazaarSyncMetadata = {
+        ...malwareBazaarSyncMetadata,
+        status: 'processing',
+        phase: 'importing',
+        attempted: counters.attempted,
+        imported: counters.imported,
+        unchanged: counters.unchanged,
+        load_failures: counters.load_failures,
+        new_hashes: counters.new_hashes,
+        message: `Importing daily export hashes (${counters.attempted} processed).`
+      };
+      updateMalwareBazaarSyncState({
+        status: 'processing',
+        phase: 'importing',
+        message: malwareBazaarSyncMetadata.message,
+        imported: counters.imported,
+        unchanged: counters.unchanged,
+        load_failures: counters.load_failures
+      });
+    }
+  });
+
+  await client.indices.refresh({ index: HASHES_INDEX_NAME });
+  counters.total_hashes = await countIndexedHashes(client);
+
+  malwareBazaarSyncMetadata = {
+    ...malwareBazaarSyncMetadata,
+    phase: 'importing',
+    query_mode: feed.query_mode,
+    upstream_records: feed.upstream_records,
+    attempted: counters.attempted,
+    message: `Importing ${feed.upstream_records} hashes into ${HASHES_INDEX_NAME} (${feed.query_mode}).`
+  };
+
+  updateMalwareBazaarSyncState({
+    status: 'processing',
+    phase: 'importing',
+    message: malwareBazaarSyncMetadata.message,
+    last_query_mode: feed.query_mode,
+    last_upstream_records: feed.upstream_records
+  });
+
+  const completedAt = nowIso();
+  malwareBazaarSyncMetadata = {
+    status: 'completed',
+    phase: 'completed',
+    started_at: startedAt,
+    completed_at: completedAt,
+    synced_at: completedAt,
+    mode: 'daily_full_csv',
+    query_mode: feed.query_mode,
+    upstream_records: feed.upstream_records,
+    attempted: counters.attempted,
+    new_hashes: counters.new_hashes,
+    total_hashes: counters.total_hashes,
+    imported: counters.imported,
+    unchanged: counters.unchanged,
+    load_failures: counters.load_failures,
+    message: 'MalwareBazaar daily full CSV sync completed.',
+    errors: []
+  };
+
+  updateMalwareBazaarSyncState({
+    status: 'completed',
+    phase: 'completed',
+    message: malwareBazaarSyncMetadata.message,
+    last_attempted_at: startedAt,
+    last_completed_at: completedAt,
+    last_successful_sync_at: completedAt,
+    last_query_mode: feed.query_mode,
+    last_upstream_records: feed.upstream_records,
+    last_new_hashes: counters.new_hashes,
+    last_total_hashes: counters.total_hashes,
+    imported: counters.imported,
+    unchanged: counters.unchanged,
+    load_failures: counters.load_failures,
+    last_error: undefined
+  });
+
+  return {
+    message: 'MalwareBazaar daily full CSV hash sync completed.',
+    mode: 'daily_full_csv',
+    query_mode: feed.query_mode,
+    upstream_records: feed.upstream_records,
+    attempted: counters.attempted,
+    new_hashes: counters.new_hashes,
+    total_hashes: counters.total_hashes,
+    imported: counters.imported,
+    unchanged: counters.unchanged,
+    load_failures: counters.load_failures,
+    errors: [],
+    status: malwareBazaarStatusBody()
+  };
+}
+
+function parseHashLine(lineRaw: string): { sha256?: string; md5?: string; sha1?: string } | null {
+  const line = lineRaw.trim().toLowerCase();
+  if (!line || line.startsWith('#')) {
+    return null;
+  }
+
+  const sha256 = line.match(/^sha256:([a-f0-9]{64})$/)?.[1] ?? line.match(/^([a-f0-9]{64})$/)?.[1];
+  if (sha256) {
+    return { sha256 };
+  }
+
+  const md5 = line.match(/^md5:([a-f0-9]{32})$/)?.[1] ?? line.match(/^([a-f0-9]{32})$/)?.[1];
+  if (md5) {
+    return { md5 };
+  }
+
+  const sha1 = line.match(/^sha1:([a-f0-9]{40})$/)?.[1] ?? line.match(/^([a-f0-9]{40})$/)?.[1];
+  if (sha1) {
+    return { sha1 };
+  }
+
+  return null;
+}
+
+function hashYamlContent(doc: { name: string; severity: string; source: string; sha256_hash?: string; content?: string }): string {
+  const hashes = new Set<string>();
+  const direct = normalizeHash(doc.sha256_hash, 64);
+  if (direct) {
+    hashes.add(direct);
+  }
+
+  for (const line of String(doc.content ?? '').split(/\r?\n/)) {
+    const parsed = parseHashLine(line);
+    if (parsed?.sha256) {
+      hashes.add(parsed.sha256.toLowerCase());
+    }
+  }
+
+  if (hashes.size === 0) {
+    return 'hashes: []\n';
+  }
+
+  const escapedName = doc.name.replace(/'/g, "''");
+  const safeName = /[:#\[\]{},|>&*!?'"\\]/.test(doc.name) ? `'${escapedName}'` : doc.name;
+  return `hashes:\n${Array.from(hashes)
+    .map((sha256) => `  - sha256: ${sha256}\n    name: ${safeName}\n    severity: ${doc.severity}\n    source: ${doc.source}`)
+    .join('\n')}\n`;
+}
+
+function bundleDigest(policyId: string, rules: BundleRuleEntry[], activeChecksums: string[]): string {
+  return crypto
+    .createHash('sha256')
+    .update(
+      JSON.stringify({
+        policy_id: policyId,
+        rules: rules.map((rule) => ({
+          id: rule.id,
+          sha256: rule.sha256,
+          enabled: rule.enabled,
+          source: rule.source,
+          updatedAt: rule.updatedAt
+        })),
+        active_checksums: activeChecksums
+      }),
+      'utf8'
+    )
+    .digest('hex');
+}
+
+async function buildSignedHashBundle(client: any, policyId: string): Promise<{ bundle?: SignedBundleResponse; error?: string }> {
+  const keyResult = getSigningPrivateKey();
+  if (!keyResult.ok || !keyResult.privateKey) {
+    return { error: keyResult.error ?? 'Signing key is unavailable.' };
+  }
+
+  const candidates = await listBundleCandidates(client, { source: 'custom', enabled: true });
+  const bundleRules: BundleRuleEntry[] = candidates
+    // Agents only need locally managed hash rules; upstream feeds stay indexed in the control plane for search and sync workflows.
+    .filter((rule) => rule.source === 'custom' && rule.validation.status === 'valid' && rule.enabled && shouldExportSeverity(rule.severity))
+    .map((rule) => {
+      const severity = normalizeSeverity(rule.severity);
+      const content = hashYamlContent({
+        name: rule.name,
+        severity,
+        source: rule.source,
+        sha256_hash: rule.sha256_hash
+      });
+      return {
+        id: rule.id,
+        filename: `${rule.id}.yaml`,
+        content,
+        sha256: crypto.createHash('sha256').update(content, 'utf8').digest('hex'),
+        enabled: rule.enabled,
+        source: rule.source,
+        updatedAt: rule.updatedAt
+      };
+    })
+    .sort((a, b) => a.id.localeCompare(b.id));
+
+  const activeChecksums = bundleRules.map((entry) => entry.sha256).sort((a, b) => a.localeCompare(b));
+  const digest = bundleDigest(policyId, bundleRules, activeChecksums);
+  const existing = bundleStateByPolicy.get(policyId);
+  const bundleState = existing && existing.content_digest === digest
+    ? existing
+    : {
+        bundle_version: (existing?.bundle_version ?? 0) + 1,
+        generated_at: nowIso(),
+        content_digest: digest
+      };
+
+  if (!existing || existing.content_digest !== digest) {
+    bundleStateByPolicy.set(policyId, bundleState);
+  }
+
+  const payload = {
+    manifest_version: 1 as const,
+    policy_id: policyId,
+    bundle_version: bundleState.bundle_version,
+    generated_at: bundleState.generated_at,
+    signing_alg: 'ed25519' as const,
+    rules: bundleRules,
+    active_checksums: activeChecksums
+  };
+
+  const payloadBytes = BufferCtor.from(JSON.stringify(payload), 'utf8');
+  const signature = crypto.sign(null, payloadBytes, keyResult.privateKey);
+
+  return {
+    bundle: {
+      ...payload,
+      signature_base64: signature.toString('base64'),
+      signed_payload_base64: payloadBytes.toString('base64')
+    }
   };
 }
 
@@ -121,16 +870,44 @@ export function registerHashRoutes(router: any): void {
   router.get(
     {
       path: '/api/xdr-defense/hashes/rules',
-      validate: false
+      validate: {
+        query: schema.object({
+          q: schema.maybe(schema.string({ maxLength: 256 })),
+          page: schema.maybe(schema.number({ min: 1, max: 100000 })),
+          pageSize: schema.maybe(schema.number({ min: 1, max: 500 }))
+        })
+      }
     },
-    async (_ctx: unknown, _req: unknown, res: any) => {
+    async (ctx: any, req: any, res: any) => {
       try {
-        return res.ok({ body: { rules: listHashRules() } });
+        const client = scopedOsClient(ctx);
+        if (!client) {
+          return res.customError({
+            statusCode: 503,
+            body: { message: 'OpenSearch scoped client unavailable.' }
+          });
+        }
+
+        const result = await listHashRulesIndexed(client, {
+          q: req.query?.q,
+          page: req.query?.page,
+          pageSize: req.query?.pageSize
+        });
+
+        return res.ok({
+          body: {
+            rules: result.rules,
+            page: result.page,
+            pageSize: result.pageSize,
+            total: result.total,
+            totalPages: Math.max(1, Math.ceil(result.total / result.pageSize))
+          }
+        });
       } catch (err: any) {
         return res.customError({
           statusCode: 500,
           body: {
-            message: 'Failed to list hash rules.',
+            message: 'Failed to list hash rules from index.',
             details: String(err?.message ?? err)
           }
         });
@@ -184,20 +961,73 @@ export function registerHashRoutes(router: any): void {
         })
       }
     },
-    async (_ctx: any, req: any, res: any) => {
+    async (ctx: any, req: any, res: any) => {
       try {
-        const created = addCustomHashRule(req.body ?? {});
-        if (created.validation.status === 'invalid') {
+        const client = scopedOsClient(ctx);
+        if (!client) {
+          return res.customError({
+            statusCode: 503,
+            body: { message: 'OpenSearch scoped client unavailable.' }
+          });
+        }
+
+        const validation = validateHashContent(req.body?.content ?? '');
+        if (validation.status === 'invalid') {
           return res.customError({
             statusCode: 400,
             body: {
               message: 'Hash rule validation failed.',
-              rule: created,
-              validation: created.validation
+              validation
             }
           });
         }
-        return res.ok({ body: created });
+
+        const lines = String(req.body?.content ?? '').split(/\r?\n/);
+        let imported = 0;
+        for (const line of lines) {
+          const parsed = parseHashLine(line);
+          if (!parsed) {
+            continue;
+          }
+
+          const id = parsed.sha256
+            ? parsed.sha256
+            : parsed.md5
+              ? `custom-md5-${parsed.md5}`
+              : parsed.sha1
+                ? `custom-sha1-${parsed.sha1}`
+                : customDocId(line);
+
+          const doc: HashIndexDocument = {
+            first_seen_utc: undefined,
+            sha256_hash: parsed.sha256,
+            md5_hash: parsed.md5,
+            sha1_hash: parsed.sha1,
+            reporter: undefined,
+            file_name: undefined,
+            file_type_guess: undefined,
+            mime_type: undefined,
+            signature: undefined,
+            clamav: undefined,
+            vtpercent: undefined,
+            imphash: undefined,
+            ssdeep: undefined,
+            tlsh: undefined,
+            source: 'custom',
+            updated_at: nowIso(),
+            name: String(req.body?.name ?? 'custom-hash'),
+            enabled: true,
+            severity: String(req.body?.severity ?? 'medium'),
+            tags: Array.isArray(req.body?.tags) ? req.body.tags.map((tag: unknown) => String(tag).trim()).filter((tag: string) => tag.length > 0) : [],
+            content: String(req.body?.content ?? ''),
+            validation
+          };
+
+          await upsertHashDocument(client, id, doc);
+          imported += 1;
+        }
+
+        return res.ok({ body: { imported, validation } });
       } catch (err: any) {
         return res.customError({
           statusCode: 500,
@@ -224,16 +1054,36 @@ export function registerHashRoutes(router: any): void {
         })
       }
     },
-    async (_ctx: any, req: any, res: any) => {
+    async (ctx: any, req: any, res: any) => {
       try {
-        const result = updateHashRule(req.params.id, req.body ?? {});
-        if (!result.updated) {
-          return res.customError({
-            statusCode: result.error === 'Rule not found.' ? 404 : 400,
-            body: { message: result.error ?? 'Failed to update hash rule.' }
-          });
+        const client = scopedOsClient(ctx);
+        if (!client) {
+          return res.customError({ statusCode: 503, body: { message: 'OpenSearch scoped client unavailable.' } });
         }
-        return res.ok({ body: result.updated });
+
+        const existing = await getHashDocument(client, req.params.id);
+        if (!existing) {
+          return res.customError({ statusCode: 404, body: { message: 'Rule not found.' } });
+        }
+
+        const nextContent = req.body?.content !== undefined ? String(req.body.content) : existing.content;
+        const validation = validateHashContent(nextContent);
+        const nextEnabled = validation.status === 'invalid' ? false : req.body?.enabled !== undefined ? Boolean(req.body.enabled) : Boolean(existing.enabled);
+        const nextDoc: HashIndexDocument = {
+          ...existing,
+          name: req.body?.name !== undefined ? String(req.body.name) : existing.name,
+          content: nextContent,
+          severity: req.body?.severity !== undefined ? String(req.body.severity) : existing.severity,
+          tags: req.body?.tags !== undefined
+            ? req.body.tags.map((tag: unknown) => String(tag).trim()).filter((tag: string) => tag.length > 0)
+            : existing.tags,
+          enabled: nextEnabled,
+          updated_at: nowIso(),
+          validation
+        };
+
+        await upsertHashDocument(client, req.params.id, nextDoc);
+        return res.ok({ body: { id: req.params.id, ...nextDoc, updatedAt: nextDoc.updated_at } });
       } catch (err: any) {
         return res.customError({
           statusCode: 500,
@@ -253,15 +1103,18 @@ export function registerHashRoutes(router: any): void {
         params: schema.object({ id: schema.string({ minLength: 1, maxLength: 256 }) })
       }
     },
-    async (_ctx: any, req: any, res: any) => {
+    async (ctx: any, req: any, res: any) => {
       try {
-        const result = deleteHashRule(req.params.id);
-        if (!result.deleted) {
-          return res.customError({
-            statusCode: result.error === 'Rule not found.' ? 404 : 400,
-            body: { message: result.error ?? 'Failed to delete hash rule.' }
-          });
+        const client = scopedOsClient(ctx);
+        if (!client) {
+          return res.customError({ statusCode: 503, body: { message: 'OpenSearch scoped client unavailable.' } });
         }
+
+        const deleted = await deleteHashDocument(client, req.params.id);
+        if (!deleted) {
+          return res.customError({ statusCode: 404, body: { message: 'Rule not found.' } });
+        }
+
         return res.ok({ body: { deleted: true, id: req.params.id } });
       } catch (err: any) {
         return res.customError({
@@ -284,21 +1137,26 @@ export function registerHashRoutes(router: any): void {
         })
       }
     },
-    async (_ctx: unknown, req: any, res: any) => {
+    async (ctx: any, req: any, res: any) => {
       try {
+        const client = scopedOsClient(ctx);
+        if (!client) {
+          return res.customError({ statusCode: 503, body: { message: 'OpenSearch scoped client unavailable.' } });
+        }
+
         const policyId = String(req.query?.policy_id ?? 'global-default');
-        const readiness = getHashSigningReadiness();
-        if (!readiness.ready) {
+        const keyResult = getSigningPrivateKey();
+        if (!keyResult.ok) {
           return res.customError({
             statusCode: 503,
             body: {
               message: 'Signed hash bundle generation unavailable.',
-              details: readiness.reason
+              details: keyResult.error
             }
           });
         }
 
-        const result = buildSignedHashBundle(policyId);
+        const result = await buildSignedHashBundle(client, policyId);
         if (!result.bundle) {
           return res.customError({
             statusCode: 503,
@@ -331,21 +1189,26 @@ export function registerHashRoutes(router: any): void {
         })
       }
     },
-    async (_ctx: unknown, req: any, res: any) => {
+    async (ctx: any, req: any, res: any) => {
       try {
+        const client = scopedOsClient(ctx);
+        if (!client) {
+          return res.customError({ statusCode: 503, body: { message: 'OpenSearch scoped client unavailable.' } });
+        }
+
         const policyId = String(req.body?.policy_id ?? 'global-default');
-        const readiness = getHashSigningReadiness();
-        if (!readiness.ready) {
+        const keyResult = getSigningPrivateKey();
+        if (!keyResult.ok) {
           return res.customError({
             statusCode: 503,
             body: {
               message: 'Hash bundle signing unavailable.',
-              details: readiness.reason
+              details: keyResult.error
             }
           });
         }
 
-        const result = buildSignedHashBundle(policyId);
+        const result = await buildSignedHashBundle(client, policyId);
         if (!result.bundle) {
           return res.customError({
             statusCode: 503,
@@ -369,14 +1232,36 @@ export function registerHashRoutes(router: any): void {
     }
   );
 
-  const syncHandler = async (_ctx: any, _req: any, res: any) => {
+  const syncApiHandler = async (ctx: any, _req: any, res: any) => {
+    if (malwareBazaarSyncInFlight) {
+      return syncAlreadyRunningResponse(res, 'malwarebazaar_api');
+    }
+
+    const client = scopedOsClient(ctx);
+    if (!client) {
+      return res.customError({ statusCode: 503, body: { message: 'OpenSearch scoped client unavailable.' } });
+    }
+
+    malwareBazaarSyncInFlight = true;
     try {
-      const result = await performMalwareBazaarSync();
-      return res.ok({ body: result });
+      const result = await performMalwareBazaarSync(client);
+      return res.ok({ body: { ...result, started: true } });
     } catch (err: any) {
+      const completedAt = nowIso();
+      malwareBazaarSyncMetadata = {
+        ...malwareBazaarSyncMetadata,
+        status: 'failed',
+        phase: 'failed',
+        completed_at: completedAt,
+        message: 'MalwareBazaar hash sync failed.',
+        errors: [String(err?.message ?? err)]
+      };
       updateMalwareBazaarSyncState({
-        last_attempted_at: new Date().toISOString(),
-        last_completed_at: new Date().toISOString(),
+        status: 'failed',
+        phase: 'failed',
+        message: malwareBazaarSyncMetadata.message,
+        last_attempted_at: malwareBazaarSyncMetadata.started_at ?? completedAt,
+        last_completed_at: completedAt,
         last_error: String(err?.message ?? err)
       });
       return res.customError({
@@ -387,7 +1272,63 @@ export function registerHashRoutes(router: any): void {
           status: malwareBazaarStatusBody()
         }
       });
+    } finally {
+      malwareBazaarSyncInFlight = false;
+      if (malwareBazaarSyncMetadata.status !== 'processing') {
+        malwareBazaarSyncMetadata = { status: 'idle' };
+      }
     }
+  };
+
+  const syncFullCsvHandler = async (ctx: any, _req: any, res: any) => {
+    if (malwareBazaarSyncInFlight) {
+      return syncAlreadyRunningResponse(res, 'daily_full_csv');
+    }
+
+    const client = scopedOsClient(ctx);
+    if (!client) {
+      return res.customError({ statusCode: 503, body: { message: 'OpenSearch scoped client unavailable.' } });
+    }
+
+    malwareBazaarSyncInFlight = true;
+
+    void (async () => {
+      try {
+        await performMalwareBazaarDailyFullSync(client);
+      } catch (err: any) {
+        const completedAt = nowIso();
+        malwareBazaarSyncMetadata = {
+          ...malwareBazaarSyncMetadata,
+          status: 'failed',
+          phase: 'failed',
+          completed_at: completedAt,
+          message: 'MalwareBazaar daily full CSV sync failed.',
+          errors: [String(err?.message ?? err)]
+        };
+        updateMalwareBazaarSyncState({
+          status: 'failed',
+          phase: 'failed',
+          message: malwareBazaarSyncMetadata.message,
+          last_attempted_at: malwareBazaarSyncMetadata.started_at ?? completedAt,
+          last_completed_at: completedAt,
+          last_error: String(err?.message ?? err)
+        });
+      } finally {
+        malwareBazaarSyncInFlight = false;
+        if (malwareBazaarSyncMetadata.status !== 'processing') {
+          malwareBazaarSyncMetadata = { status: 'idle' };
+        }
+      }
+    })();
+
+    return res.ok({
+      body: {
+        message: 'MalwareBazaar daily sync started.',
+        mode: 'daily_full_csv',
+        started: true,
+        status: malwareBazaarStatusBody()
+      }
+    });
   };
 
   router.post(
@@ -395,7 +1336,15 @@ export function registerHashRoutes(router: any): void {
       path: '/api/xdr-defense/hashes/malwarebazaar/sync',
       validate: false
     },
-    syncHandler
+    syncApiHandler
+  );
+
+  router.post(
+    {
+      path: '/api/xdr-defense/hashes/malwarebazaar/full/sync',
+      validate: false
+    },
+    syncFullCsvHandler
   );
 
   router.post(
@@ -403,6 +1352,6 @@ export function registerHashRoutes(router: any): void {
       path: '/api/xdr-defense/hashes/open-source/sync',
       validate: false
     },
-    syncHandler
+    syncApiHandler
   );
 }

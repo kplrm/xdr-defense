@@ -85,6 +85,7 @@ interface PersistedHashState {
 }
 
 const HASH_STATE_FILE = resolvePluginDataPath('registries', 'hash_rules.json');
+const LEGACY_MALWARE_BAZAAR_RULE_ID = 'malwarebazaar-recent-feed';
 let stateCache: PersistedHashState | null = null;
 
 function isoNow(): string {
@@ -133,6 +134,58 @@ function isHashLine(line: string): boolean {
     /^(sha256:[a-f0-9]{64})(\s+#.*)?$/i.test(line) ||
     /^([a-f0-9]{32}|[a-f0-9]{40}|[a-f0-9]{64})(\s+#.*)?$/i.test(line)
   );
+}
+
+function extractSha256Lines(contentRaw: unknown): string[] {
+  const entries = new Set<string>();
+  for (const rawLine of String(contentRaw ?? '').split(/\r?\n/)) {
+    const line = rawLine.trim().toLowerCase();
+    const match = line.match(/^sha256:([a-f0-9]{64})$/) ?? line.match(/^([a-f0-9]{64})$/);
+    if (match) {
+      entries.add(match[1]);
+    }
+  }
+  return [...entries];
+}
+
+function malwareBazaarRuleIdForSha256(sha256: string): string {
+  return `malwarebazaar-sha256-${sha256.toLowerCase()}`;
+}
+
+function malwareBazaarRuleNameForSha256(sha256: string): string {
+  return `MalwareBazaar SHA256 ${sha256.slice(0, 12)}`;
+}
+
+function migrateLegacyMalwareBazaarAggregateRule(state: PersistedHashState): boolean {
+  const legacy = state.malwareBazaarRules[LEGACY_MALWARE_BAZAAR_RULE_ID];
+  if (!legacy) {
+    return false;
+  }
+
+  const hashes = extractSha256Lines(legacy.content);
+  for (const sha256 of hashes) {
+    const id = malwareBazaarRuleIdForSha256(sha256);
+    if (state.malwareBazaarRules[id]) {
+      continue;
+    }
+
+    const content = `sha256:${sha256}`;
+    const validation = validateHashContent(content);
+    state.malwareBazaarRules[id] = {
+      id,
+      name: malwareBazaarRuleNameForSha256(sha256),
+      source: 'malwarebazaar',
+      enabled: legacy.enabled && validation.status === 'valid',
+      severity: sanitizeSeverity(legacy.severity),
+      tags: normalizeTags(legacy.tags),
+      content,
+      updatedAt: legacy.updatedAt || isoNow(),
+      validation
+    };
+  }
+
+  delete state.malwareBazaarRules[LEGACY_MALWARE_BAZAAR_RULE_ID];
+  return true;
 }
 
 export function validateHashContent(contentRaw: unknown): RuleValidation {
@@ -254,6 +307,10 @@ function loadState(): PersistedHashState {
     malwareBazaarRules,
     bundleStates: raw?.bundleStates && typeof raw.bundleStates === 'object' ? raw.bundleStates : {}
   };
+
+  if (migrateLegacyMalwareBazaarAggregateRule(stateCache)) {
+    saveState(stateCache);
+  }
 
   return stateCache;
 }
@@ -378,6 +435,52 @@ export function getExistingMalwareBazaarHashRuleState(id: unknown): { enabled: b
   const normalizedId = idRaw.startsWith('malwarebazaar-') ? idRaw : `malwarebazaar-${idRaw || ''}`;
   const existing = state.malwareBazaarRules[normalizedId];
   return existing ? { enabled: existing.enabled } : null;
+}
+
+export function getMalwareBazaarRuleBySha256(sha256: string): HashRuleRecord | null {
+  const state = loadState();
+  const id = malwareBazaarRuleIdForSha256(sha256);
+  const rule = state.malwareBazaarRules[id];
+  return rule ? cloneRule(rule) : null;
+}
+
+export function listMalwareBazaarHashRules(): HashRuleSummary[] {
+  const state = loadState();
+  return Object.values(state.malwareBazaarRules)
+    .map(cloneRule)
+    .sort((a, b) => a.name.localeCompare(b.name))
+    .map((rule) => ({
+      id: rule.id,
+      name: rule.name,
+      source: rule.source,
+      enabled: rule.enabled,
+      severity: rule.severity,
+      tags: [...rule.tags],
+      updatedAt: rule.updatedAt,
+      validation: {
+        ...rule.validation,
+        errors: [...rule.validation.errors],
+        warnings: [...rule.validation.warnings]
+      }
+    }));
+}
+
+export function removeLegacyMalwareBazaarAggregateRule(): boolean {
+  const state = loadState();
+  if (!state.malwareBazaarRules[LEGACY_MALWARE_BAZAAR_RULE_ID]) {
+    return false;
+  }
+  delete state.malwareBazaarRules[LEGACY_MALWARE_BAZAAR_RULE_ID];
+  saveState(state);
+  return true;
+}
+
+export function malwareBazaarIdForHash(sha256: string): string {
+  return malwareBazaarRuleIdForSha256(sha256);
+}
+
+export function malwareBazaarNameForHash(sha256: string): string {
+  return malwareBazaarRuleNameForSha256(sha256);
 }
 
 export function updateHashRule(

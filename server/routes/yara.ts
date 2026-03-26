@@ -20,6 +20,8 @@ import {
   ingestYaraRolloutStatusReport,
   listEnrolledAgents,
   listRolloutStatus,
+  ruleHealthIndexForTimestamp,
+  ruleHealthTimestamp,
   retryRetryableCommands
 } from '../lib/yara_rollout';
 
@@ -256,6 +258,18 @@ const rolloutStatusValidationSchema = {
       { defaultValue: [] }
     ),
     reported_at: schema.number({ min: 0 })
+  })
+};
+
+const inventoryValidationSchema = {
+  body: schema.object({
+    agent_id: schema.string({ minLength: 1, maxLength: 256 }),
+    loaded_rule_count: schema.number({ min: 0 }),
+    failed_rules: schema.arrayOf(schema.object({}, { unknowns: 'allow' }), { defaultValue: [] }),
+    checked_at: schema.oneOf([
+      schema.number({ min: 0 }),
+      schema.string({ minLength: 1, maxLength: 128 })
+    ])
   })
 };
 
@@ -1106,6 +1120,59 @@ export function registerYaraRoutes(router: any): void {
           statusCode: 500,
           body: {
             message: 'Failed to query rule inventory.',
+            details: String(err?.message ?? err)
+          }
+        });
+      }
+    }
+  );
+
+  router.post(
+    {
+      path: '/api/xdr-defense/yara-rules/inventory',
+      validate: inventoryValidationSchema
+    },
+    async (ctx: any, req: any, res: any) => {
+      try {
+        const client = scopedOsClient(ctx);
+        if (!client) {
+          return res.customError({
+            statusCode: 503,
+            body: { message: 'OpenSearch scoped client unavailable.' }
+          });
+        }
+
+        const checkedAtIso = ruleHealthTimestamp(req.body?.checked_at);
+        const targetIndex = ruleHealthIndexForTimestamp(req.body?.checked_at);
+        const failedRules = Array.isArray(req.body?.failed_rules) ? req.body.failed_rules : [];
+
+        await client.index({
+          index: targetIndex,
+          refresh: 'wait_for',
+          body: {
+            '@timestamp': checkedAtIso,
+            kind: 'yara_rule_inventory',
+            agent_id: req.body.agent_id,
+            loaded_rule_count: req.body.loaded_rule_count,
+            failed_rules: failedRules,
+            failed_rule_count: failedRules.length,
+            checked_at: req.body.checked_at,
+            ingest_time: new Date().toISOString()
+          }
+        });
+
+        return res.ok({
+          body: {
+            accepted: true,
+            stored_index: targetIndex,
+            failed_rule_count: failedRules.length
+          }
+        });
+      } catch (err: any) {
+        return res.customError({
+          statusCode: 500,
+          body: {
+            message: 'Failed to ingest YARA rule inventory.',
             details: String(err?.message ?? err)
           }
         });

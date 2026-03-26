@@ -26,15 +26,21 @@ export interface YaraForgePersistedSyncStatus {
 }
 
 export interface MalwareBazaarPersistedSyncStatus {
+  status?: 'idle' | 'processing' | 'completed' | 'failed';
+  phase?: 'idle' | 'requesting_export' | 'preparing_download' | 'downloading' | 'importing' | 'completed' | 'failed';
+  message?: string;
   api_key_updated_at?: string;
   last_attempted_at?: string;
   last_completed_at?: string;
   last_successful_sync_at?: string;
   last_cursor_seen_at?: string;
-  last_query_mode?: 'recent' | 'time-window';
+  last_query_mode?: string;
   last_upstream_records?: number;
   last_new_hashes?: number;
   last_total_hashes?: number;
+  imported?: number;
+  unchanged?: number;
+  load_failures?: number;
   last_error?: string;
 }
 

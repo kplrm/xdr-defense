@@ -52,10 +52,20 @@ interface ManagedRule {
   tags: string[];
   updatedAt: string;
   validation: RuleValidation;
+  sha256_hash?: string;
+  md5_hash?: string;
+  sha1_hash?: string;
+  file_name?: string;
+  signature?: string;
+  reporter?: string;
 }
 
 interface RulesResponse {
   rules: ManagedRule[];
+  page?: number;
+  pageSize?: number;
+  total?: number;
+  totalPages?: number;
 }
 
 interface YaraTestResponse {
@@ -157,6 +167,10 @@ interface ForgeCoreSyncMetadata {
 }
 
 interface MalwareBazaarStatus {
+  status?: 'idle' | 'processing' | 'completed' | 'failed';
+  phase?: 'idle' | 'requesting_export' | 'preparing_download' | 'downloading' | 'importing' | 'completed' | 'failed';
+  mode?: 'malwarebazaar_api' | 'daily_full_csv';
+  message?: string;
   api_key_configured: boolean;
   api_key_updated_at?: string;
   last_attempted_at?: string;
@@ -167,6 +181,10 @@ interface MalwareBazaarStatus {
   last_upstream_records?: number;
   last_new_hashes?: number;
   last_total_hashes?: number;
+  attempted?: number;
+  imported?: number;
+  unchanged?: number;
+  load_failures?: number;
   last_error?: string;
 }
 
@@ -191,17 +209,19 @@ export const XdrDefenseApp: React.FC<XdrDefenseAppProps> = ({ http, notification
   // ---- Rule data ----
   const [yaraRules, setYaraRules] = useState<ManagedRule[]>([]);
   const [hashRules, setHashRules] = useState<ManagedRule[]>([]);
+  const [hashTotal, setHashTotal] = useState(0);
   const [behavioralRules, setBehavioralRules] = useState<ManagedRule[]>([]);
   const [bundleMetadata, setBundleMetadata] = useState<BundleMetadata | null>(null);
   const [rolloutStatus, setRolloutStatus] = useState<RolloutStatusResponse | null>(null);
   const [yaraForgeSyncStatus, setYaraForgeSyncStatus] = useState<ForgeCoreSyncMetadata | null>(null);
   const [isSyncingYaraForge, setIsSyncingYaraForge] = useState(false);
   const [malwareBazaarStatus, setMalwareBazaarStatus] = useState<MalwareBazaarStatus | null>(null);
+  const [isSyncingMalwareBazaar, setIsSyncingMalwareBazaar] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
 
   // ---- UI state ----
   const [drawerOpen, setDrawerOpen] = useState<'none' | 'yara' | 'hashes' | 'behavioral' | 'malwarebazaar-config'>('none');
-  const [banner, setBanner] = useState<{ kind: 'success' | 'error'; message: string } | null>(null);
+  const [banner, setBanner] = useState<{ kind: 'success' | 'error' | 'warning'; message: string } | null>(null);
 
   // ---- YARA pagination / search / selection ----
   const [yaraSearchQuery, setYaraSearchQuery] = useState('');
@@ -209,6 +229,13 @@ export const XdrDefenseApp: React.FC<XdrDefenseAppProps> = ({ http, notification
   const [yaraPageIndex, setYaraPageIndex] = useState(0);
   const [selectedYaraIds, setSelectedYaraIds] = useState<Set<string>>(new Set());
   const [isYaraBusy, setIsYaraBusy] = useState(false);
+
+  // ---- Hashes pagination / search / selection ----
+  const [hashSearchQuery, setHashSearchQuery] = useState('');
+  const [hashPageSize, setHashPageSize] = useState(20);
+  const [hashPageIndex, setHashPageIndex] = useState(0);
+  const [selectedHashIds, setSelectedHashIds] = useState<Set<string>>(new Set());
+  const [isHashesBusy, setIsHashesBusy] = useState(false);
 
   // ---- YARA form ----
   const [yaraFormName, setYaraFormName] = useState('');
@@ -248,14 +275,32 @@ export const XdrDefenseApp: React.FC<XdrDefenseAppProps> = ({ http, notification
     }
   }, [http]);
 
-  const refreshHashRules = useCallback(async () => {
+  const refreshHashRules = useCallback(async (input?: { q?: string; pageIndex?: number; pageSize?: number }) => {
     try {
-      const payload = (await http.get('/api/xdr-defense/hashes/rules')) as RulesResponse;
+      const q = input?.q ?? hashSearchQuery;
+      const pageIndex = input?.pageIndex ?? hashPageIndex;
+      const pageSize = input?.pageSize ?? hashPageSize;
+      const params = new URLSearchParams();
+      if (q.trim().length > 0) {
+        params.set('q', q.trim());
+      }
+      params.set('page', String(pageIndex + 1));
+      params.set('pageSize', String(pageSize));
+      const payload = (await http.get(`/api/xdr-defense/hashes/rules?${params.toString()}`)) as RulesResponse;
       setHashRules(Array.isArray(payload?.rules) ? payload.rules : []);
+      setHashTotal(Number(payload?.total ?? 0));
     } catch (err: unknown) {
+      const statusCode = Number((err as any)?.body?.statusCode ?? (err as any)?.statusCode ?? 0);
+      if (statusCode === 404) {
+        // On fresh startup/reload windows, the route can briefly return Not Found.
+        // Treat this as an empty state instead of showing a blocking error banner.
+        setHashRules([]);
+        setHashTotal(0);
+        return;
+      }
       setBanner({ kind: 'error', message: `Failed to load hash rules: ${String((err as Error)?.message ?? err)}` });
     }
-  }, [http]);
+  }, [http, hashSearchQuery, hashPageIndex, hashPageSize]);
 
   const refreshBehavioralRules = useCallback(async () => {
     try {
@@ -308,8 +353,10 @@ export const XdrDefenseApp: React.FC<XdrDefenseAppProps> = ({ http, notification
     try {
       const payload = (await http.get('/api/xdr-defense/hashes/malwarebazaar/config')) as MalwareBazaarStatus;
       setMalwareBazaarStatus(payload);
+      setIsSyncingMalwareBazaar(payload?.status === 'processing');
     } catch {
       setMalwareBazaarStatus(null);
+      setIsSyncingMalwareBazaar(false);
     }
   }, [http]);
 
@@ -344,6 +391,24 @@ export const XdrDefenseApp: React.FC<XdrDefenseAppProps> = ({ http, notification
     };
   }, [isSyncingYaraForge, yaraForgeSyncStatus?.status, refreshYaraForgeSyncStatus]);
 
+  useEffect(() => {
+    if (!isSyncingMalwareBazaar && malwareBazaarStatus?.status !== 'processing') {
+      return;
+    }
+
+    const intervalId = window.setInterval(() => {
+      refreshMalwareBazaarStatus();
+    }, 750);
+
+    return () => {
+      window.clearInterval(intervalId);
+    };
+  }, [isSyncingMalwareBazaar, malwareBazaarStatus?.status, refreshMalwareBazaarStatus]);
+
+  useEffect(() => {
+    refreshHashRules();
+  }, [hashSearchQuery, hashPageIndex, hashPageSize, refreshHashRules]);
+
   // ---------------------------------------------------------------------------
   // YARA tab — filtered + paged rows (computed before columns for select-all)
   // ---------------------------------------------------------------------------
@@ -362,6 +427,13 @@ export const XdrDefenseApp: React.FC<XdrDefenseAppProps> = ({ http, notification
 
   const allPageSelected = pagedYaraRules.length > 0 && pagedYaraRules.every((r) => selectedYaraIds.has(r.id));
   const somePageSelected = pagedYaraRules.some((r) => selectedYaraIds.has(r.id));
+
+  const hashTotalPages = Math.max(1, Math.ceil(hashTotal / hashPageSize));
+  const hashCurrentPage = Math.min(hashPageIndex, hashTotalPages - 1);
+  const pagedHashRules = hashRules;
+
+  const allHashPageSelected = pagedHashRules.length > 0 && pagedHashRules.every((r) => selectedHashIds.has(r.id));
+  const someHashPageSelected = pagedHashRules.some((r) => selectedHashIds.has(r.id));
 
   // ---------------------------------------------------------------------------
   // YARA tab columns
@@ -466,6 +538,47 @@ export const XdrDefenseApp: React.FC<XdrDefenseAppProps> = ({ http, notification
   // ---------------------------------------------------------------------------
 
   const hashColumns = [
+    {
+      name: (
+        <EuiCheckbox
+          id="hash-select-all"
+          label=""
+          checked={allHashPageSelected}
+          indeterminate={someHashPageSelected && !allHashPageSelected}
+          onChange={() => {
+            if (allHashPageSelected) {
+              setSelectedHashIds((prev) => {
+                const next = new Set(prev);
+                pagedHashRules.forEach((r) => next.delete(r.id));
+                return next;
+              });
+            } else {
+              setSelectedHashIds((prev) => {
+                const next = new Set(prev);
+                pagedHashRules.forEach((r) => next.add(r.id));
+                return next;
+              });
+            }
+          }}
+        />
+      ),
+      width: '40px',
+      render: (rule: ManagedRule) => (
+        <EuiCheckbox
+          id={`hash-sel-${rule.id}`}
+          label=""
+          checked={selectedHashIds.has(rule.id)}
+          onChange={() => {
+            setSelectedHashIds((prev) => {
+              const next = new Set(prev);
+              if (next.has(rule.id)) next.delete(rule.id);
+              else next.add(rule.id);
+              return next;
+            });
+          }}
+        />
+      ),
+    },
     { field: 'name', name: 'Name' },
     { field: 'source', name: 'Source' },
     { field: 'severity', name: 'Severity' },
@@ -1099,7 +1212,33 @@ export const XdrDefenseApp: React.FC<XdrDefenseAppProps> = ({ http, notification
 
   const renderHashesTab = () => {
     const status = malwareBazaarStatus;
-    const sortedHashRules = hashRules.slice().sort((a, b) => a.name.localeCompare(b.name));
+    const hashSyncing = isSyncingMalwareBazaar || status?.status === 'processing';
+    const activeMode = status?.mode ?? (status?.last_query_mode === 'daily_full_csv_export' ? 'daily_full_csv' : 'malwarebazaar_api');
+    const isDailyFullMode = activeMode === 'daily_full_csv';
+    const hashSyncBadgeColor =
+      status?.status === 'failed'
+        ? 'danger'
+        : status?.status === 'completed'
+          ? 'success'
+          : status?.status === 'processing'
+            ? 'warning'
+            : 'hollow';
+    const hashSyncButtonLabel = hashSyncing
+      ? status?.phase === 'requesting_export'
+        ? 'Requesting export'
+        : status?.phase === 'preparing_download'
+          ? 'Preparing download'
+          : status?.phase === 'importing'
+            ? isDailyFullMode
+              ? 'Importing daily export'
+              : 'Syncing Hashes'
+            : isDailyFullMode
+              ? 'Downloading daily export'
+              : 'Downloading feed'
+      : 'Sync MalwareBazaar Hash Feed';
+    const selectedList = [...selectedHashIds];
+    const hasSelection = selectedList.length > 0;
+    const selectedRules = hashRules.filter((r) => selectedHashIds.has(r.id));
 
     return (
       <>
@@ -1119,17 +1258,25 @@ export const XdrDefenseApp: React.FC<XdrDefenseAppProps> = ({ http, notification
                   </EuiBadge>
                 </EuiFlexItem>
                 <EuiFlexItem grow={false}>
-                  <EuiText size="xs" color="subdued">
-                    <p>
-                      {status?.last_successful_sync_at
-                        ? `last sync ${new Date(status.last_successful_sync_at).toLocaleString()}`
-                        : 'No successful MalwareBazaar sync yet.'}
-                      {status?.last_query_mode ? ` · mode ${status.last_query_mode}` : ''}
-                      {status?.last_total_hashes !== undefined ? ` · stored ${status.last_total_hashes}` : ''}
-                    </p>
-                  </EuiText>
+                  <EuiBadge color={hashSyncBadgeColor}>sync {status?.status ?? 'idle'}</EuiBadge>
                 </EuiFlexItem>
               </EuiFlexGroup>
+              <EuiSpacer size="xs" />
+              <EuiText size="xs" color="subdued">
+                <p>
+                  {status?.last_successful_sync_at
+                    ? `last sync ${new Date(status.last_successful_sync_at).toLocaleString()}`
+                    : 'No successful MalwareBazaar sync yet.'}
+                  {status?.last_total_hashes !== undefined ? ` · stored ${status.last_total_hashes}` : ''}
+                  {status?.phase ? ` · phase ${status.phase}` : ''}
+                </p>
+              </EuiText>
+              {status?.message && (
+                <>
+                  <EuiSpacer size="xs" />
+                  <EuiText size="xs" color="subdued"><p>{status.message}</p></EuiText>
+                </>
+              )}
             </EuiFlexItem>
             <EuiFlexItem grow={false}>
               <EuiFlexGroup gutterSize="s">
@@ -1143,14 +1290,20 @@ export const XdrDefenseApp: React.FC<XdrDefenseAppProps> = ({ http, notification
                 <EuiFlexItem grow={false}>
                   <EuiButton
                     fill
+                    isDisabled={hashSyncing}
+                    isLoading={hashSyncing && !isDailyFullMode}
                     onClick={async () => {
+                      if (hashSyncing) return;
+                      setIsSyncingMalwareBazaar(true);
                       setBanner(null);
                       try {
                         const result = (await http.post('/api/xdr-defense/hashes/malwarebazaar/sync', {
                           body: JSON.stringify({}),
                         })) as {
                           query_mode: string;
+                          mode?: string;
                           upstream_records: number;
+                          attempted?: number;
                           new_hashes: number;
                           total_hashes: number;
                           imported: number;
@@ -1158,23 +1311,91 @@ export const XdrDefenseApp: React.FC<XdrDefenseAppProps> = ({ http, notification
                           load_failures: number;
                           errors: string[];
                         };
-                        await refreshHashRules();
-                        await refreshMalwareBazaarStatus();
+                        await refreshAll();
                         const errorText = Array.isArray(result.errors) && result.errors.length > 0 ? `\nErrors:\n${result.errors.join('\n')}` : '';
                         notifications.toasts.addSuccess(
-                          `MalwareBazaar sync complete. Added ${result.new_hashes} new hashes, stored ${result.total_hashes} total.`
+                          `MalwareBazaar API sync complete. Added ${result.new_hashes} new hashes, stored ${result.total_hashes} total.`
                         );
                         setBanner({
                           kind: 'success',
-                          message: `MalwareBazaar hash sync completed. Upstream records ${result.upstream_records}, new hashes ${result.new_hashes}, imported ${result.imported}, unchanged ${result.unchanged}, load failures ${result.load_failures}.${errorText}`,
+                          message: `MalwareBazaar hash API sync completed. Attempted ${result.attempted ?? result.upstream_records}, upstream records ${result.upstream_records}, new hashes ${result.new_hashes}, imported ${result.imported}, unchanged ${result.unchanged}, load failures ${result.load_failures}.${errorText}`,
                         });
                       } catch (err: unknown) {
-                        notifications.toasts.addDanger({ title: 'Unable to sync MalwareBazaar hashes', text: (err as Error)?.message });
-                        setBanner({ kind: 'error', message: `Failed to sync MalwareBazaar hashes: ${String((err as Error)?.message ?? err)}` });
+                        const statusCode = Number((err as any)?.body?.statusCode ?? (err as any)?.statusCode ?? 0);
+                        if (statusCode === 409) {
+                          await refreshMalwareBazaarStatus();
+                          notifications.toasts.addWarning({ title: 'MalwareBazaar sync already running', text: 'Another MalwareBazaar sync is already in progress.' });
+                          setBanner({ kind: 'warning', message: 'MalwareBazaar sync already running. The current sync will continue in the background.' });
+                        } else {
+                          notifications.toasts.addDanger({ title: 'Unable to sync MalwareBazaar hashes', text: (err as Error)?.message });
+                          setBanner({ kind: 'error', message: `Failed to sync MalwareBazaar hashes: ${String((err as Error)?.message ?? err)}` });
+                        }
+                      } finally {
+                        await refreshMalwareBazaarStatus();
+                        setIsSyncingMalwareBazaar(false);
                       }
                     }}
                   >
-                    Sync MalwareBazaar Hash Feed
+                    {hashSyncButtonLabel}
+                  </EuiButton>
+                </EuiFlexItem>
+                <EuiFlexItem grow={false}>
+                  <EuiButton
+                    isDisabled={hashSyncing}
+                    isLoading={hashSyncing && isDailyFullMode}
+                    onClick={async () => {
+                      if (hashSyncing) return;
+                      setIsSyncingMalwareBazaar(true);
+                      setBanner(null);
+                      try {
+                        const result = (await http.post('/api/xdr-defense/hashes/malwarebazaar/full/sync', {
+                          body: JSON.stringify({}),
+                        })) as {
+                          query_mode: string;
+                          mode?: string;
+                          upstream_records: number;
+                          attempted?: number;
+                          new_hashes: number;
+                          total_hashes: number;
+                          imported: number;
+                          unchanged: number;
+                          load_failures: number;
+                          errors: string[];
+                          started?: boolean;
+                        };
+                        await refreshMalwareBazaarStatus();
+                        if (result.started) {
+                          notifications.toasts.addSuccess('MalwareBazaar daily sync started.');
+                          setBanner({
+                            kind: 'success',
+                            message: 'MalwareBazaar daily sync started. Progress will continue in the background.',
+                          });
+                        } else {
+                          const errorText = Array.isArray(result.errors) && result.errors.length > 0 ? `\nErrors:\n${result.errors.join('\n')}` : '';
+                          notifications.toasts.addSuccess(
+                            `MalwareBazaar daily sync complete. Added ${result.new_hashes} new hashes.`
+                          );
+                          setBanner({
+                            kind: 'success',
+                            message: `MalwareBazaar daily sync completed. Attempted ${result.attempted ?? result.upstream_records}, imported ${result.imported}, unchanged ${result.unchanged}, load failures ${result.load_failures}, total stored ${result.total_hashes}.${errorText}`,
+                          });
+                        }
+                      } catch (err: unknown) {
+                        const statusCode = Number((err as any)?.body?.statusCode ?? (err as any)?.statusCode ?? 0);
+                        if (statusCode === 409) {
+                          await refreshMalwareBazaarStatus();
+                          notifications.toasts.addWarning({ title: 'MalwareBazaar sync already running', text: 'Another MalwareBazaar sync is already in progress.' });
+                          setBanner({ kind: 'warning', message: 'MalwareBazaar sync already running. The current sync will continue in the background.' });
+                        } else {
+                          notifications.toasts.addDanger({ title: 'Unable to sync MalwareBazaar daily hashes', text: (err as Error)?.message });
+                          setBanner({ kind: 'error', message: `Failed to sync MalwareBazaar daily hashes: ${String((err as Error)?.message ?? err)}` });
+                        }
+                      } finally {
+                        await refreshMalwareBazaarStatus();
+                      }
+                    }}
+                  >
+                    Sync MalwareBazaar Daily
                   </EuiButton>
                 </EuiFlexItem>
                 <EuiFlexItem grow={false}>
@@ -1187,16 +1408,166 @@ export const XdrDefenseApp: React.FC<XdrDefenseAppProps> = ({ http, notification
 
         <EuiSpacer size="m" />
 
-        <div style={{ overflowX: 'auto' }}>
-          <EuiInMemoryTable
-            itemId="id"
-            items={sortedHashRules}
-            columns={hashColumns as any}
-            loading={isLoading}
-            pagination={false}
-            sorting={false}
+        <EuiPanel>
+          <EuiTitle size="s"><h3>Hash rules</h3></EuiTitle>
+          <EuiSpacer size="s" />
+
+          <EuiFlexGroup alignItems="center" justifyContent="spaceBetween" gutterSize="s" wrap>
+            <EuiFlexItem grow={false}>
+              <EuiFlexGroup alignItems="center" gutterSize="s" wrap>
+                <EuiFlexItem grow={false}>
+                  <EuiButton
+                    size="s"
+                    isDisabled={!hasSelection || isHashesBusy}
+                    isLoading={isHashesBusy}
+                    onClick={async () => {
+                      if (!hasSelection || isHashesBusy) return;
+                      setIsHashesBusy(true);
+                      setBanner(null);
+                      let ok = 0; let fail = 0;
+                      for (const id of selectedList) {
+                        try {
+                          await http.put(`/api/xdr-defense/hashes/rules/${encodeURIComponent(id)}`, { body: JSON.stringify({ enabled: true }) });
+                          ok++;
+                        } catch { fail++; }
+                      }
+                      await refreshHashRules();
+                      setIsHashesBusy(false);
+                      setBanner({ kind: 'success', message: `Enabled ${ok} hash rule(s)${fail > 0 ? `, failed ${fail}` : ''}.` });
+                    }}
+                  >
+                    Enable
+                  </EuiButton>
+                </EuiFlexItem>
+                <EuiFlexItem grow={false}>
+                  <EuiButton
+                    size="s"
+                    isDisabled={!hasSelection || isHashesBusy}
+                    isLoading={isHashesBusy}
+                    onClick={async () => {
+                      if (!hasSelection || isHashesBusy) return;
+                      setIsHashesBusy(true);
+                      setBanner(null);
+                      let ok = 0; let fail = 0;
+                      for (const id of selectedList) {
+                        try {
+                          await http.put(`/api/xdr-defense/hashes/rules/${encodeURIComponent(id)}`, { body: JSON.stringify({ enabled: false }) });
+                          ok++;
+                        } catch { fail++; }
+                      }
+                      await refreshHashRules();
+                      setIsHashesBusy(false);
+                      setBanner({ kind: 'success', message: `Disabled ${ok} hash rule(s)${fail > 0 ? `, failed ${fail}` : ''}.` });
+                    }}
+                  >
+                    Disable
+                  </EuiButton>
+                </EuiFlexItem>
+                <EuiFlexItem grow={false}>
+                  <EuiButton
+                    color="danger"
+                    fill
+                    size="s"
+                    isDisabled={!hasSelection || isHashesBusy}
+                    isLoading={isHashesBusy}
+                    onClick={async () => {
+                      if (!hasSelection || isHashesBusy) return;
+                      if (!window.confirm(`Delete ${selectedList.length} selected hash rule(s)?`)) return;
+                      setIsHashesBusy(true);
+                      setBanner(null);
+                      let deleted = 0; let failed = 0;
+                      for (const rule of selectedRules) {
+                        try {
+                          await http.delete(`/api/xdr-defense/hashes/rules/${encodeURIComponent(rule.id)}`);
+                          deleted++;
+                        } catch { failed++; }
+                      }
+                      setSelectedHashIds(new Set());
+                      await refreshHashRules();
+                      setIsHashesBusy(false);
+                      setBanner({ kind: 'success', message: `Bulk delete completed. Deleted ${deleted}${failed > 0 ? `, failed ${failed}` : ''}.` });
+                    }}
+                  >
+                    Delete
+                  </EuiButton>
+                </EuiFlexItem>
+                {hasSelection && (
+                  <EuiFlexItem grow={false}>
+                    <EuiText size="xs" color="subdued"><p>{selectedList.length} selected</p></EuiText>
+                  </EuiFlexItem>
+                )}
+              </EuiFlexGroup>
+            </EuiFlexItem>
+            <EuiFlexItem grow={false}>
+              <EuiButtonEmpty
+                size="xs"
+                onClick={async () => {
+                  await refreshMalwareBazaarStatus();
+                }}
+              >
+                Refresh Sync Status
+              </EuiButtonEmpty>
+            </EuiFlexItem>
+          </EuiFlexGroup>
+
+          <EuiHorizontalRule margin="s" />
+
+          <EuiFieldSearch
+            value={hashSearchQuery}
+            onChange={(e) => {
+              setHashSearchQuery(e.target.value);
+              setHashPageIndex(0);
+            }}
+            placeholder="Search hashes, file names, signatures, reporter..."
+            fullWidth
+            aria-label="Search indexed hash values and metadata"
           />
-        </div>
+
+          <EuiSpacer size="m" />
+
+          <div style={{ overflowX: 'auto', overflowY: 'auto', maxHeight: '55vh' }}>
+            <div style={{ display: 'inline-block', minWidth: 1280 }}>
+              <EuiInMemoryTable
+                itemId="id"
+                items={pagedHashRules}
+                columns={hashColumns as any}
+                loading={isLoading}
+                pagination={false}
+                sorting={false}
+              />
+            </div>
+          </div>
+
+          <EuiSpacer size="s" />
+
+          <EuiFlexGroup alignItems="center" justifyContent="spaceBetween" responsive={false}>
+            <EuiFlexItem grow={false}>
+              <EuiFlexGroup alignItems="center" gutterSize="s" responsive={false}>
+                <EuiFlexItem grow={false}>
+                  <EuiText size="s"><span>Rows per page</span></EuiText>
+                </EuiFlexItem>
+                <EuiFlexItem grow={false}>
+                  <EuiSelect
+                    compressed
+                    value={String(hashPageSize)}
+                    onChange={(e) => {
+                      setHashPageSize(Number(e.target.value));
+                      setHashPageIndex(0);
+                    }}
+                    options={pageSizeOptions.map((o) => ({ value: String(o.value), text: o.text }))}
+                  />
+                </EuiFlexItem>
+              </EuiFlexGroup>
+            </EuiFlexItem>
+            <EuiFlexItem grow={false}>
+              <EuiPagination
+                pageCount={hashTotalPages}
+                activePage={hashCurrentPage}
+                onPageClick={setHashPageIndex}
+              />
+            </EuiFlexItem>
+          </EuiFlexGroup>
+        </EuiPanel>
 
         {/* Add hashes flyout */}
         {drawerOpen === 'hashes' && (
@@ -1678,7 +2049,7 @@ export const XdrDefenseApp: React.FC<XdrDefenseAppProps> = ({ http, notification
       {banner && (
         <>
           <EuiCallOut
-            color={banner.kind === 'success' ? 'success' : 'danger'}
+            color={banner.kind === 'success' ? 'success' : banner.kind === 'warning' ? 'warning' : 'danger'}
             title={<span style={{ whiteSpace: 'pre-wrap' }}>{banner.message}</span>}
           />
           <EuiSpacer size="m" />

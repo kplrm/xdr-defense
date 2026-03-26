@@ -78,6 +78,15 @@ export interface BulkHashUpsertResult {
   failed: number;
 }
 
+export interface BundleEligibilityCandidate {
+  enabled: boolean;
+  severity: unknown;
+  source?: unknown;
+  validation?: {
+    status?: unknown;
+  };
+}
+
 let hashesIndexReady = false;
 let hashesIndexEnsureInFlight: Promise<void> | null = null;
 
@@ -542,4 +551,30 @@ export async function listBundleCandidates(
   }
 
   return rules;
+}
+
+function normalizeBundleSeverity(raw: unknown): 'critical' | 'high' | 'medium' | 'low' {
+  const value = String(raw ?? '').trim().toLowerCase();
+  if (value === 'critical' || value === 'crit') {
+    return 'critical';
+  }
+  if (value === 'high') {
+    return 'high';
+  }
+  if (value === 'low') {
+    return 'low';
+  }
+  return 'medium';
+}
+
+export function isEligibleHashBundleRule(rule: BundleEligibilityCandidate): boolean {
+  if (!rule.enabled) {
+    return false;
+  }
+
+  if (String(rule.validation?.status ?? '').toLowerCase() !== 'valid') {
+    return false;
+  }
+
+  return normalizeBundleSeverity(rule.severity) === 'critical';
 }

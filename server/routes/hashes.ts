@@ -10,7 +10,7 @@ import {
   deleteHashDocument,
   ensureHashesIndex,
   getHashDocument,
-  listBundleCandidates,
+  isEligibleHashBundleRule,
   listHashRulesIndexed,
   malwareBazaarDocId,
   upsertHashDocument,
@@ -83,14 +83,39 @@ interface SignedBundleResponse {
 type Severity = 'critical' | 'high' | 'medium' | 'low';
 
 const MALWAREBAZAAR_DEFAULT_RECENT_LIMIT = 100;
+const HASH_BUNDLE_CHUNK_SIZE = 5000;
+const HASH_BUNDLE_SCAN_PAGE_SIZE = 5000;
 
-const bundleStateByPolicy = new Map<string, { bundle_version: number; generated_at: string; content_digest: string }>();
+interface DailyHashBundleSnapshot {
+  dateVersion: string;
+  bundleVersion: number;
+  generatedAt: string;
+  rules: BundleRuleEntry[];
+  activeChecksums: string[];
+  totalCriticalHashes: number;
+}
+
+let dailyHashBundleSnapshot: DailyHashBundleSnapshot | null = null;
+let dailyHashBundleBuildInFlight: Promise<DailyHashBundleSnapshot> | null = null;
 
 let malwareBazaarSyncInFlight = false;
 let malwareBazaarSyncMetadata: MalwareBazaarSyncMetadata = { status: 'idle' };
 
 function nowIso(): string {
   return new Date().toISOString();
+}
+
+function todayDateVersion(): string {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function dateVersionToBundleVersion(dateVersion: string): number {
+  const normalized = String(dateVersion).replace(/-/g, '');
+  const parsed = Number.parseInt(normalized, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    throw new Error(`invalid date version ${dateVersion}`);
+  }
+  return parsed;
 }
 
 function formatMb(bytes: number): string {
@@ -229,25 +254,6 @@ function normalizeHash(raw: unknown, length: number): string | undefined {
   const value = String(raw ?? '').trim().toLowerCase();
   const re = new RegExp(`^[a-f0-9]{${length}}$`);
   return re.test(value) ? value : undefined;
-}
-
-function normalizeSeverity(raw: unknown): Severity {
-  const value = String(raw ?? '').trim().toLowerCase();
-  if (value === 'critical' || value === 'crit') {
-    return 'critical';
-  }
-  if (value === 'high') {
-    return 'high';
-  }
-  if (value === 'low') {
-    return 'low';
-  }
-  return 'medium';
-}
-
-function shouldExportSeverity(raw: unknown): boolean {
-  const severity = normalizeSeverity(raw);
-  return severity === 'critical' || severity === 'high';
 }
 
 function severityRank(severity: Severity): number {
@@ -526,6 +532,8 @@ async function performMalwareBazaarSync(client: any): Promise<Record<string, unk
     last_error: undefined
   });
 
+  await prebuildDailyHashBundleSnapshotBestEffort(client, { forceRebuild: true });
+
   return {
     message: 'MalwareBazaar hash sync completed.',
     mode: 'malwarebazaar_api',
@@ -714,6 +722,8 @@ async function performMalwareBazaarDailyFullSync(client: any): Promise<Record<st
     last_error: undefined
   });
 
+  await prebuildDailyHashBundleSnapshotBestEffort(client, { forceRebuild: true });
+
   return {
     message: 'MalwareBazaar daily full CSV hash sync completed.',
     mode: 'daily_full_csv',
@@ -754,49 +764,185 @@ function parseHashLine(lineRaw: string): { sha256?: string; md5?: string; sha1?:
   return null;
 }
 
-function hashYamlContent(doc: { name: string; severity: string; source: string; sha256_hash?: string; content?: string }): string {
-  const hashes = new Set<string>();
-  const direct = normalizeHash(doc.sha256_hash, 64);
-  if (direct) {
-    hashes.add(direct);
-  }
-
-  for (const line of String(doc.content ?? '').split(/\r?\n/)) {
-    const parsed = parseHashLine(line);
-    if (parsed?.sha256) {
-      hashes.add(parsed.sha256.toLowerCase());
-    }
-  }
-
-  if (hashes.size === 0) {
+function hashYamlChunkContent(items: Array<{ sha256_hash: string; name: string; severity: string; source: string }>): string {
+  if (items.length === 0) {
     return 'hashes: []\n';
   }
 
-  const escapedName = doc.name.replace(/'/g, "''");
-  const safeName = /[:#\[\]{},|>&*!?'"\\]/.test(doc.name) ? `'${escapedName}'` : doc.name;
-  return `hashes:\n${Array.from(hashes)
-    .map((sha256) => `  - sha256: ${sha256}\n    name: ${safeName}\n    severity: ${doc.severity}\n    source: ${doc.source}`)
-    .join('\n')}\n`;
+  const lines: string[] = ['hashes:'];
+  for (const item of items) {
+    const escapedName = item.name.replace(/'/g, "''");
+    const safeName = /[:#\[\]{},|>&*!?'"\\]/.test(item.name) ? `'${escapedName}'` : item.name;
+    lines.push(`  - sha256: ${item.sha256_hash}`);
+    lines.push(`    name: ${safeName}`);
+    lines.push(`    severity: ${item.severity}`);
+    lines.push(`    source: ${item.source}`);
+  }
+
+  return `${lines.join('\n')}\n`;
 }
 
-function bundleDigest(policyId: string, rules: BundleRuleEntry[], activeChecksums: string[]): string {
-  return crypto
-    .createHash('sha256')
-    .update(
-      JSON.stringify({
-        policy_id: policyId,
-        rules: rules.map((rule) => ({
-          id: rule.id,
-          sha256: rule.sha256,
-          enabled: rule.enabled,
-          source: rule.source,
-          updatedAt: rule.updatedAt
-        })),
-        active_checksums: activeChecksums
-      }),
-      'utf8'
-    )
-    .digest('hex');
+async function buildDailyHashBundleSnapshot(client: any): Promise<DailyHashBundleSnapshot> {
+  await ensureHashesIndex(client);
+
+  const dateVersion = todayDateVersion();
+  const generatedAt = `${dateVersion}T00:00:00.000Z`;
+  const bundleVersion = dateVersionToBundleVersion(dateVersion);
+  const rules: BundleRuleEntry[] = [];
+  const activeChecksums: string[] = [];
+
+  let searchAfter: unknown[] | undefined;
+  let chunkRows: Array<{ sha256_hash: string; name: string; severity: string; source: string }> = [];
+  let chunkSeq = 0;
+  let totalCriticalHashes = 0;
+
+  const flushChunk = () => {
+    if (chunkRows.length === 0) {
+      return;
+    }
+
+    chunkSeq += 1;
+    const chunkID = `critical-hashes-${dateVersion}-${String(chunkSeq).padStart(5, '0')}`;
+    const content = hashYamlChunkContent(chunkRows);
+    const sha256 = crypto.createHash('sha256').update(content, 'utf8').digest('hex');
+    const entry: BundleRuleEntry = {
+      id: chunkID,
+      filename: `${chunkID}.yaml`,
+      content,
+      sha256,
+      enabled: true,
+      source: 'bundle.chunk',
+      updatedAt: generatedAt
+    };
+
+    rules.push(entry);
+    activeChecksums.push(sha256);
+    chunkRows = [];
+  };
+
+  while (true) {
+    const response = await client.search({
+      index: HASHES_INDEX_NAME,
+      size: HASH_BUNDLE_SCAN_PAGE_SIZE,
+      allow_no_indices: true,
+      ignore_unavailable: true,
+      body: {
+        query: {
+          bool: {
+            must: [
+              { term: { enabled: true } },
+              { term: { 'validation.status': 'valid' } },
+              {
+                bool: {
+                  should: [
+                    { term: { severity: 'critical' } },
+                    { term: { severity: 'crit' } }
+                  ],
+                  minimum_should_match: 1
+                }
+              }
+            ]
+          }
+        },
+        _source: ['sha256_hash', 'name', 'source', 'severity'],
+        sort: [{ _id: { order: 'asc' } }],
+        ...(searchAfter ? { search_after: searchAfter } : {})
+      }
+    });
+
+    const hits = Array.isArray(response?.body?.hits?.hits) ? response.body.hits.hits : [];
+    if (hits.length === 0) {
+      break;
+    }
+
+    for (const hit of hits) {
+      const source = hit?._source ?? {};
+      if (!isEligibleHashBundleRule({
+        enabled: source.enabled ?? true,
+        severity: source.severity,
+        source: source.source,
+        validation: { status: source?.validation?.status ?? 'valid' }
+      })) {
+        continue;
+      }
+
+      const sha256 = normalizeHash(source.sha256_hash, 64);
+      if (!sha256) {
+        continue;
+      }
+
+      chunkRows.push({
+        sha256_hash: sha256,
+        name: String(source.name ?? `Malware SHA256 ${sha256.slice(0, 12)}`),
+        severity: 'critical',
+        source: String(source.source ?? 'unknown')
+      });
+      totalCriticalHashes += 1;
+
+      if (chunkRows.length >= HASH_BUNDLE_CHUNK_SIZE) {
+        flushChunk();
+      }
+    }
+
+    const lastHit = hits[hits.length - 1];
+    const lastSort = Array.isArray(lastHit?.sort) ? lastHit.sort : undefined;
+    if (!lastSort || lastSort.length === 0 || hits.length < HASH_BUNDLE_SCAN_PAGE_SIZE) {
+      break;
+    }
+    searchAfter = lastSort;
+  }
+
+  flushChunk();
+  activeChecksums.sort((a, b) => a.localeCompare(b));
+
+  return {
+    dateVersion,
+    bundleVersion,
+    generatedAt,
+    rules,
+    activeChecksums,
+    totalCriticalHashes
+  };
+}
+
+async function ensureDailyHashBundleSnapshot(
+  client: any,
+  options?: { forceRebuild?: boolean }
+): Promise<DailyHashBundleSnapshot> {
+  const forceRebuild = Boolean(options?.forceRebuild);
+  const today = todayDateVersion();
+  if (!forceRebuild && dailyHashBundleSnapshot && dailyHashBundleSnapshot.dateVersion === today) {
+    return dailyHashBundleSnapshot;
+  }
+
+  if (forceRebuild) {
+    dailyHashBundleSnapshot = null;
+  }
+
+  if (!dailyHashBundleBuildInFlight) {
+    dailyHashBundleBuildInFlight = (async () => {
+      const snapshot = await buildDailyHashBundleSnapshot(client);
+      dailyHashBundleSnapshot = snapshot;
+      return snapshot;
+    })().finally(() => {
+      dailyHashBundleBuildInFlight = null;
+    });
+  }
+
+  return dailyHashBundleBuildInFlight;
+}
+
+async function prebuildDailyHashBundleSnapshotBestEffort(
+  client: any,
+  options?: { forceRebuild?: boolean }
+): Promise<void> {
+  try {
+    await ensureDailyHashBundleSnapshot(client, options);
+  } catch (err: any) {
+    // Keep sync completion resilient even if bundle prebuild fails.
+    // eslint-disable-next-line no-console
+    console.error('xdr-defense: failed to prebuild daily hash bundle snapshot', err);
+  }
 }
 
 async function buildSignedHashBundle(client: any, policyId: string): Promise<{ bundle?: SignedBundleResponse; error?: string }> {
@@ -805,53 +951,15 @@ async function buildSignedHashBundle(client: any, policyId: string): Promise<{ b
     return { error: keyResult.error ?? 'Signing key is unavailable.' };
   }
 
-  const candidates = await listBundleCandidates(client, { source: 'custom', enabled: true });
-  const bundleRules: BundleRuleEntry[] = candidates
-    // Agents only need locally managed hash rules; upstream feeds stay indexed in the control plane for search and sync workflows.
-    .filter((rule) => rule.source === 'custom' && rule.validation.status === 'valid' && rule.enabled && shouldExportSeverity(rule.severity))
-    .map((rule) => {
-      const severity = normalizeSeverity(rule.severity);
-      const content = hashYamlContent({
-        name: rule.name,
-        severity,
-        source: rule.source,
-        sha256_hash: rule.sha256_hash
-      });
-      return {
-        id: rule.id,
-        filename: `${rule.id}.yaml`,
-        content,
-        sha256: crypto.createHash('sha256').update(content, 'utf8').digest('hex'),
-        enabled: rule.enabled,
-        source: rule.source,
-        updatedAt: rule.updatedAt
-      };
-    })
-    .sort((a, b) => a.id.localeCompare(b.id));
-
-  const activeChecksums = bundleRules.map((entry) => entry.sha256).sort((a, b) => a.localeCompare(b));
-  const digest = bundleDigest(policyId, bundleRules, activeChecksums);
-  const existing = bundleStateByPolicy.get(policyId);
-  const bundleState = existing && existing.content_digest === digest
-    ? existing
-    : {
-        bundle_version: (existing?.bundle_version ?? 0) + 1,
-        generated_at: nowIso(),
-        content_digest: digest
-      };
-
-  if (!existing || existing.content_digest !== digest) {
-    bundleStateByPolicy.set(policyId, bundleState);
-  }
-
+  const snapshot = await ensureDailyHashBundleSnapshot(client);
   const payload = {
     manifest_version: 1 as const,
     policy_id: policyId,
-    bundle_version: bundleState.bundle_version,
-    generated_at: bundleState.generated_at,
+    bundle_version: snapshot.bundleVersion,
+    generated_at: snapshot.generatedAt,
     signing_alg: 'ed25519' as const,
-    rules: bundleRules,
-    active_checksums: activeChecksums
+    rules: snapshot.rules,
+    active_checksums: snapshot.activeChecksums
   };
 
   const payloadBytes = BufferCtor.from(JSON.stringify(payload), 'utf8');
@@ -1156,6 +1264,7 @@ export function registerHashRoutes(router: any): void {
           });
         }
 
+        await prebuildDailyHashBundleSnapshotBestEffort(client, { forceRebuild: true });
         const result = await buildSignedHashBundle(client, policyId);
         if (!result.bundle) {
           return res.customError({

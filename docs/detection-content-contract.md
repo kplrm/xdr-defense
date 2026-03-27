@@ -22,6 +22,7 @@ Each content type is fetched independently using a signed bundle endpoint:
 
 - `GET /api/xdr-defense/yara/bundle?policy_id=<id>`
 - `GET /api/xdr-defense/hashes/bundle?policy_id=<id>`
+- `GET /api/xdr-defense/hashes/custom-overlay/bundle?policy_id=<id>`
 - `GET /api/xdr-defense/behavioral/bundle?policy_id=<id>`
 
 Bundle payload (conceptual schema):
@@ -55,6 +56,7 @@ Notes:
 - `rules` remains the transport key for all content types to keep agent-side activation generic.
 - For hashes, `content` is line-based hash indicators (`sha256:<hex>` or `<hex>` per line).
 - For behavioral rules, `content` is YAML/JSON rule definitions sourced from Sigma.
+- The custom hash overlay endpoint reuses the same signed bundle schema but only returns pending immediate custom critical SHA256 hashes, one YAML rule file per custom hash document.
 
 ## Content Management APIs
 
@@ -66,6 +68,7 @@ Per content type:
 - `DELETE /api/xdr-defense/<type>/rules/{id}`
 - `POST /api/xdr-defense/<type>/bundle/build`
 - `GET /api/xdr-defense/<type>/bundle?policy_id=<id>`
+- `GET /api/xdr-defense/hashes/custom-overlay/bundle?policy_id=<id>`
 
 Feed sync endpoints:
 
@@ -76,6 +79,7 @@ Feed sync endpoints:
 ## Rollout and Agent Activation
 
 - Any create/update/enable/disable/delete operation queues rollout dispatch.
+- Custom hash create/update/delete/enable/disable also updates a persisted immediate overlay set. MalwareBazaar API sync completion and daily full sync completion clear that overlay state because the next full hash bundle is authoritative.
 - Agent polls bundle endpoints on interval and atomically replaces local on-disk content by type:
   - `/etc/xdr-agent/rules/malware/yara`
   - `/etc/xdr-agent/rules/malware/hashes`

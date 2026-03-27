@@ -44,10 +44,16 @@ export interface MalwareBazaarPersistedSyncStatus {
   last_error?: string;
 }
 
+export interface MbAutoUpdateSettings {
+  enabled: boolean;
+  requests_per_day: number;
+}
+
 interface UpstreamSyncState {
   version: 1;
   yara_forge: YaraForgePersistedSyncStatus;
   malwarebazaar: MalwareBazaarPersistedSyncStatus;
+  mb_auto_update: MbAutoUpdateSettings;
 }
 
 const UPSTREAM_SYNC_STATE_FILE = resolvePluginDataPath('sync', 'upstream_sync_state.json');
@@ -56,16 +62,25 @@ function defaultState(): UpstreamSyncState {
   return {
     version: 1,
     yara_forge: {},
-    malwarebazaar: {}
+    malwarebazaar: {},
+    mb_auto_update: { enabled: false, requests_per_day: 1000 }
   };
 }
 
 function loadState(): UpstreamSyncState {
   const raw = readJsonFile<UpstreamSyncState>(UPSTREAM_SYNC_STATE_FILE, defaultState());
+  const rawMb = raw?.mb_auto_update;
+  const rawRequestsPerDay = Number(rawMb?.requests_per_day ?? 1000);
   return {
     version: 1,
     yara_forge: raw?.yara_forge && typeof raw.yara_forge === 'object' ? raw.yara_forge : {},
-    malwarebazaar: raw?.malwarebazaar && typeof raw.malwarebazaar === 'object' ? raw.malwarebazaar : {}
+    malwarebazaar: raw?.malwarebazaar && typeof raw.malwarebazaar === 'object' ? raw.malwarebazaar : {},
+    mb_auto_update: {
+      enabled: Boolean(rawMb?.enabled),
+      requests_per_day: Number.isFinite(rawRequestsPerDay)
+        ? Math.min(100000, Math.max(1, rawRequestsPerDay))
+        : 1000
+    }
   };
 }
 
@@ -101,4 +116,19 @@ export function updateMalwareBazaarSyncState(
   };
   saveState(state);
   return state.malwarebazaar;
+}
+
+export function getMbAutoUpdateSettings(): MbAutoUpdateSettings {
+  return loadState().mb_auto_update;
+}
+
+export function saveMbAutoUpdateSettings(settings: MbAutoUpdateSettings): MbAutoUpdateSettings {
+  const validated: MbAutoUpdateSettings = {
+    enabled: Boolean(settings.enabled),
+    requests_per_day: Math.min(100000, Math.max(1, Math.round(Number(settings.requests_per_day) || 1000)))
+  };
+  const state = loadState();
+  state.mb_auto_update = validated;
+  saveState(state);
+  return validated;
 }

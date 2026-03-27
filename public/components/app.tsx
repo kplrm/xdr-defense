@@ -8,6 +8,7 @@ import {
   EuiCheckbox,
   EuiCodeBlock,
   EuiFieldSearch,
+  EuiFieldNumber,
   EuiFieldText,
   EuiFlexGroup,
   EuiFlexItem,
@@ -188,6 +189,87 @@ interface MalwareBazaarStatus {
   last_error?: string;
 }
 
+interface HashRolloutResponse {
+  started?: boolean;
+  success?: boolean;
+  message?: string;
+  dateVersion?: string;
+  bundle_version?: number;
+  generated_at?: string;
+  rule_count?: number;
+  total_critical_hashes?: number;
+}
+
+interface HashRolloutStatusRow {
+  agent: string;
+  policy: string;
+  state: string;
+  full_bundle_version?: number;
+  custom_bundle_version?: number;
+  last_reported?: string;
+  error?: string;
+}
+
+interface HashRolloutStatusPageResponse {
+  page: number;
+  pageSize: number;
+  total: number;
+  totalPages: number;
+  stale_after_minutes: number;
+  items: HashRolloutStatusRow[];
+}
+
+interface HashRolloutRetryResponse {
+  success: boolean;
+  message: string;
+  overlay_bundle_version: number;
+  pending_custom_entries: number;
+  generated_at: string;
+}
+
+interface HashFormState {
+  name: string;
+  enabled: boolean;
+  severity: string;
+  tags: string;
+  sha256_hash: string;
+  md5_hash: string;
+  sha1_hash: string;
+  reporter: string;
+  file_name: string;
+  file_type_guess: string;
+  mime_type: string;
+  signature: string;
+  clamav: string;
+  vtpercent: string;
+  imphash: string;
+  ssdeep: string;
+  tlsh: string;
+}
+
+type HashFormErrors = Partial<Record<keyof HashFormState, string>>;
+type HashTextField = Exclude<keyof HashFormState, 'enabled'>;
+
+const createEmptyHashForm = (): HashFormState => ({
+  name: '',
+  enabled: true,
+  severity: 'medium',
+  tags: '',
+  sha256_hash: '',
+  md5_hash: '',
+  sha1_hash: '',
+  reporter: '',
+  file_name: '',
+  file_type_guess: '',
+  mime_type: '',
+  signature: '',
+  clamav: '',
+  vtpercent: '',
+  imphash: '',
+  ssdeep: '',
+  tlsh: '',
+});
+
 // ---------------------------------------------------------------------------
 // Props
 // ---------------------------------------------------------------------------
@@ -209,7 +291,10 @@ export const XdrDefenseApp: React.FC<XdrDefenseAppProps> = ({ http, notification
   // ---- Rule data ----
   const [yaraRules, setYaraRules] = useState<ManagedRule[]>([]);
   const [hashRules, setHashRules] = useState<ManagedRule[]>([]);
-  const [hashTotal, setHashTotal] = useState(0);
+  const [hashRolloutRows, setHashRolloutRows] = useState<HashRolloutStatusRow[]>([]);
+  const [hashRolloutTotal, setHashRolloutTotal] = useState(0);
+  const [hashRolloutTotalPages, setHashRolloutTotalPages] = useState(1);
+  const [hashRolloutStaleAfterMinutes, setHashRolloutStaleAfterMinutes] = useState(30);
   const [behavioralRules, setBehavioralRules] = useState<ManagedRule[]>([]);
   const [bundleMetadata, setBundleMetadata] = useState<BundleMetadata | null>(null);
   const [rolloutStatus, setRolloutStatus] = useState<RolloutStatusResponse | null>(null);
@@ -217,6 +302,8 @@ export const XdrDefenseApp: React.FC<XdrDefenseAppProps> = ({ http, notification
   const [isSyncingYaraForge, setIsSyncingYaraForge] = useState(false);
   const [malwareBazaarStatus, setMalwareBazaarStatus] = useState<MalwareBazaarStatus | null>(null);
   const [isSyncingMalwareBazaar, setIsSyncingMalwareBazaar] = useState(false);
+  const [isRollingOutHashes, setIsRollingOutHashes] = useState(false);
+  const [isRetryingHashRollout, setIsRetryingHashRollout] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
 
   // ---- UI state ----
@@ -231,11 +318,8 @@ export const XdrDefenseApp: React.FC<XdrDefenseAppProps> = ({ http, notification
   const [isYaraBusy, setIsYaraBusy] = useState(false);
 
   // ---- Hashes pagination / search / selection ----
-  const [hashSearchQuery, setHashSearchQuery] = useState('');
-  const [hashPageSize, setHashPageSize] = useState(20);
-  const [hashPageIndex, setHashPageIndex] = useState(0);
-  const [selectedHashIds, setSelectedHashIds] = useState<Set<string>>(new Set());
-  const [isHashesBusy, setIsHashesBusy] = useState(false);
+  const [hashRolloutPageSize, setHashRolloutPageSize] = useState(20);
+  const [hashRolloutPageIndex, setHashRolloutPageIndex] = useState(0);
 
   // ---- YARA form ----
   const [yaraFormName, setYaraFormName] = useState('');
@@ -244,11 +328,14 @@ export const XdrDefenseApp: React.FC<XdrDefenseAppProps> = ({ http, notification
   const [yaraFormTags, setYaraFormTags] = useState('');
 
   // ---- Hash form ----
-  const [hashFormName, setHashFormName] = useState('');
-  const [hashFormContent, setHashFormContent] = useState('');
-  const [hashFormSeverity, setHashFormSeverity] = useState('medium');
-  const [hashFormTags, setHashFormTags] = useState('');
+  const [hashForm, setHashForm] = useState<HashFormState>(createEmptyHashForm());
+  const [hashFormErrors, setHashFormErrors] = useState<HashFormErrors>({});
   const [malwareBazaarApiKey, setMalwareBazaarApiKey] = useState('');
+  const [mbAutoUpdateEnabled, setMbAutoUpdateEnabled] = useState(false);
+  const [mbRequestsPerDayInput, setMbRequestsPerDayInput] = useState('1000');
+  const [mbCallsPerWindow, setMbCallsPerWindow] = useState(3);
+  const [mbSettingsSaving, setMbSettingsSaving] = useState(false);
+  const [mbSyncNowRunning, setMbSyncNowRunning] = useState(false);
 
   // ---- Behavioral form ----
   const [behavioralFormName, setBehavioralFormName] = useState('');
@@ -261,6 +348,65 @@ export const XdrDefenseApp: React.FC<XdrDefenseAppProps> = ({ http, notification
   const [testLookback, setTestLookback] = useState('60');
   const [testContent, setTestContent] = useState('');
   const [testOutput, setTestOutput] = useState('No test run yet.');
+
+  const validateCustomHashForm = useCallback((form: HashFormState): HashFormErrors => {
+    const errors: HashFormErrors = {};
+    const sha256 = form.sha256_hash.trim();
+    const md5 = form.md5_hash.trim();
+    const sha1 = form.sha1_hash.trim();
+    const imphash = form.imphash.trim();
+
+    if (!sha256 && !md5 && !sha1) {
+      const message = 'Provide at least one hash value.';
+      errors.sha256_hash = message;
+      errors.md5_hash = message;
+      errors.sha1_hash = message;
+    }
+
+    if (sha256 && !/^[a-fA-F0-9]{64}$/.test(sha256)) {
+      errors.sha256_hash = 'SHA256 must be exactly 64 hexadecimal characters.';
+    }
+    if (md5 && !/^[a-fA-F0-9]{32}$/.test(md5)) {
+      errors.md5_hash = 'MD5 must be exactly 32 hexadecimal characters.';
+    }
+    if (sha1 && !/^[a-fA-F0-9]{40}$/.test(sha1)) {
+      errors.sha1_hash = 'SHA1 must be exactly 40 hexadecimal characters.';
+    }
+    if (imphash && !/^[a-fA-F0-9]{32}$/.test(imphash)) {
+      errors.imphash = 'imphash must be exactly 32 hexadecimal characters.';
+    }
+
+    return errors;
+  }, []);
+
+  const parseHashFieldErrors = useCallback((err: unknown): HashFormErrors => {
+    const errorBody = ((err as any)?.body?.attributes?.body ?? (err as any)?.body ?? {}) as any;
+    const rawFieldErrors = (errorBody?.field_errors ?? {}) as Record<string, unknown>;
+    const parsed: HashFormErrors = {};
+
+    for (const [field, value] of Object.entries(rawFieldErrors)) {
+      const message = Array.isArray(value)
+        ? value.map((entry) => String(entry)).join(' ')
+        : String(value);
+      if (!message) {
+        continue;
+      }
+      if (field in createEmptyHashForm()) {
+        parsed[field as keyof HashFormState] = message;
+      }
+    }
+
+    return parsed;
+  }, []);
+
+  const customHashErrorMessage = useCallback((err: unknown): string => {
+    const errorBody = ((err as any)?.body?.attributes?.body ?? (err as any)?.body ?? {}) as any;
+    const bodyMessage = String(errorBody?.message ?? '').trim();
+    if (bodyMessage) {
+      return bodyMessage;
+    }
+    return String((err as Error)?.message ?? err);
+  }, []);
 
   // ---------------------------------------------------------------------------
   // API helpers
@@ -275,32 +421,43 @@ export const XdrDefenseApp: React.FC<XdrDefenseAppProps> = ({ http, notification
     }
   }, [http]);
 
-  const refreshHashRules = useCallback(async (input?: { q?: string; pageIndex?: number; pageSize?: number }) => {
+  const refreshHashRules = useCallback(async () => {
     try {
-      const q = input?.q ?? hashSearchQuery;
-      const pageIndex = input?.pageIndex ?? hashPageIndex;
-      const pageSize = input?.pageSize ?? hashPageSize;
       const params = new URLSearchParams();
-      if (q.trim().length > 0) {
-        params.set('q', q.trim());
-      }
-      params.set('page', String(pageIndex + 1));
-      params.set('pageSize', String(pageSize));
+      params.set('page', '1');
+      params.set('pageSize', '20');
       const payload = (await http.get(`/api/xdr-defense/hashes/rules?${params.toString()}`)) as RulesResponse;
       setHashRules(Array.isArray(payload?.rules) ? payload.rules : []);
-      setHashTotal(Number(payload?.total ?? 0));
     } catch (err: unknown) {
       const statusCode = Number((err as any)?.body?.statusCode ?? (err as any)?.statusCode ?? 0);
       if (statusCode === 404) {
         // On fresh startup/reload windows, the route can briefly return Not Found.
         // Treat this as an empty state instead of showing a blocking error banner.
         setHashRules([]);
-        setHashTotal(0);
         return;
       }
       setBanner({ kind: 'error', message: `Failed to load hash rules: ${String((err as Error)?.message ?? err)}` });
     }
-  }, [http, hashSearchQuery, hashPageIndex, hashPageSize]);
+  }, [http]);
+
+  const refreshHashRolloutStatus = useCallback(async (input?: { pageIndex?: number; pageSize?: number }) => {
+    try {
+      const pageIndex = input?.pageIndex ?? hashRolloutPageIndex;
+      const pageSize = input?.pageSize ?? hashRolloutPageSize;
+      const params = new URLSearchParams();
+      params.set('page', String(pageIndex + 1));
+      params.set('pageSize', String(pageSize));
+      const payload = (await http.get(`/api/xdr-defense/hashes/rollouts/status?${params.toString()}`)) as HashRolloutStatusPageResponse;
+      setHashRolloutRows(Array.isArray(payload?.items) ? payload.items : []);
+      setHashRolloutTotal(Number(payload?.total ?? 0));
+      setHashRolloutTotalPages(Math.max(1, Number(payload?.totalPages ?? 1)));
+      setHashRolloutStaleAfterMinutes(Number(payload?.stale_after_minutes ?? 30));
+    } catch {
+      setHashRolloutRows([]);
+      setHashRolloutTotal(0);
+      setHashRolloutTotalPages(1);
+    }
+  }, [http, hashRolloutPageIndex, hashRolloutPageSize]);
 
   const refreshBehavioralRules = useCallback(async () => {
     try {
@@ -360,6 +517,22 @@ export const XdrDefenseApp: React.FC<XdrDefenseAppProps> = ({ http, notification
     }
   }, [http]);
 
+  const loadMbAutoUpdateSettings = useCallback(async () => {
+    try {
+      const data = (await http.get('/api/xdr-defense/hashes/malwarebazaar/auto-update-settings')) as {
+        enabled: boolean;
+        requests_per_day: number;
+        calls_per_window: number;
+      };
+      setMbAutoUpdateEnabled(Boolean(data?.enabled));
+      const requestsPerDay = Number(data?.requests_per_day) || 1000;
+      setMbRequestsPerDayInput(String(requestsPerDay));
+      setMbCallsPerWindow(Number(data?.calls_per_window) ?? 3);
+    } catch {
+      // use defaults on error
+    }
+  }, [http]);
+
   const refreshAll = useCallback(async () => {
     await Promise.all([
       refreshYaraRules(),
@@ -369,8 +542,9 @@ export const XdrDefenseApp: React.FC<XdrDefenseAppProps> = ({ http, notification
       refreshRolloutStatus(),
       refreshYaraForgeSyncStatus(),
       refreshMalwareBazaarStatus(),
+      refreshHashRolloutStatus(),
     ]);
-  }, [refreshYaraRules, refreshHashRules, refreshBehavioralRules, refreshBundleMetadata, refreshRolloutStatus, refreshYaraForgeSyncStatus, refreshMalwareBazaarStatus]);
+  }, [refreshYaraRules, refreshHashRules, refreshBehavioralRules, refreshBundleMetadata, refreshRolloutStatus, refreshYaraForgeSyncStatus, refreshMalwareBazaarStatus, refreshHashRolloutStatus]);
 
   useEffect(() => {
     setIsLoading(true);
@@ -406,8 +580,8 @@ export const XdrDefenseApp: React.FC<XdrDefenseAppProps> = ({ http, notification
   }, [isSyncingMalwareBazaar, malwareBazaarStatus?.status, refreshMalwareBazaarStatus]);
 
   useEffect(() => {
-    refreshHashRules();
-  }, [hashSearchQuery, hashPageIndex, hashPageSize, refreshHashRules]);
+    refreshHashRolloutStatus();
+  }, [hashRolloutPageIndex, hashRolloutPageSize, refreshHashRolloutStatus]);
 
   // ---------------------------------------------------------------------------
   // YARA tab — filtered + paged rows (computed before columns for select-all)
@@ -427,13 +601,6 @@ export const XdrDefenseApp: React.FC<XdrDefenseAppProps> = ({ http, notification
 
   const allPageSelected = pagedYaraRules.length > 0 && pagedYaraRules.every((r) => selectedYaraIds.has(r.id));
   const somePageSelected = pagedYaraRules.some((r) => selectedYaraIds.has(r.id));
-
-  const hashTotalPages = Math.max(1, Math.ceil(hashTotal / hashPageSize));
-  const hashCurrentPage = Math.min(hashPageIndex, hashTotalPages - 1);
-  const pagedHashRules = hashRules;
-
-  const allHashPageSelected = pagedHashRules.length > 0 && pagedHashRules.every((r) => selectedHashIds.has(r.id));
-  const someHashPageSelected = pagedHashRules.some((r) => selectedHashIds.has(r.id));
 
   // ---------------------------------------------------------------------------
   // YARA tab columns
@@ -537,106 +704,47 @@ export const XdrDefenseApp: React.FC<XdrDefenseAppProps> = ({ http, notification
   // Hashes tab columns
   // ---------------------------------------------------------------------------
 
-  const hashColumns = [
+  const hashRolloutColumns = [
+    { field: 'agent', name: 'Agent' },
+    { field: 'policy', name: 'Policy' },
     {
-      name: (
-        <EuiCheckbox
-          id="hash-select-all"
-          label=""
-          checked={allHashPageSelected}
-          indeterminate={someHashPageSelected && !allHashPageSelected}
-          onChange={() => {
-            if (allHashPageSelected) {
-              setSelectedHashIds((prev) => {
-                const next = new Set(prev);
-                pagedHashRules.forEach((r) => next.delete(r.id));
-                return next;
-              });
-            } else {
-              setSelectedHashIds((prev) => {
-                const next = new Set(prev);
-                pagedHashRules.forEach((r) => next.add(r.id));
-                return next;
-              });
-            }
-          }}
-        />
-      ),
-      width: '40px',
-      render: (rule: ManagedRule) => (
-        <EuiCheckbox
-          id={`hash-sel-${rule.id}`}
-          label=""
-          checked={selectedHashIds.has(rule.id)}
-          onChange={() => {
-            setSelectedHashIds((prev) => {
-              const next = new Set(prev);
-              if (next.has(rule.id)) next.delete(rule.id);
-              else next.add(rule.id);
-              return next;
-            });
-          }}
-        />
-      ),
-    },
-    { field: 'name', name: 'Name' },
-    { field: 'source', name: 'Source' },
-    { field: 'severity', name: 'Severity' },
-    { field: 'tags', name: 'Tags', render: (tags: string[]) => tags.join(', ') },
-    {
-      field: 'validation',
-      name: 'Validation',
-      render: (v: RuleValidation) => (
-        <EuiBadge color={v.status === 'valid' ? 'success' : 'danger'}>{v.status}</EuiBadge>
-      ),
-    },
-    {
+      field: 'state',
       name: 'State',
-      render: (rule: ManagedRule) => (
-        <EuiSwitch
-          label="enabled"
-          checked={rule.enabled}
-          disabled={rule.validation.status === 'invalid'}
-          compressed
-          onChange={async (e) => {
-            try {
-              await http.put(`/api/xdr-defense/hashes/rules/${encodeURIComponent(rule.id)}`, {
-                body: JSON.stringify({ enabled: (e.target as HTMLInputElement).checked }),
-              });
-              await refreshHashRules();
-              setBanner({ kind: 'success', message: 'Hash rule state updated.' });
-            } catch (err: unknown) {
-              setBanner({ kind: 'error', message: `Failed to update hash rule: ${String((err as Error)?.message ?? err)}` });
-            }
-          }}
-        />
-      ),
-    },
-    {
-      field: 'updatedAt',
-      name: 'Updated',
-      render: (date: string) => new Date(date).toLocaleString(),
-    },
-    {
-      name: 'Actions',
-      render: (rule: ManagedRule) => (
-        <EuiButtonEmpty
-          color="danger"
-          size="xs"
-          onClick={async () => {
-            if (!window.confirm('Delete this hash rule from registry?')) return;
-            try {
-              await http.delete(`/api/xdr-defense/hashes/rules/${encodeURIComponent(rule.id)}`);
-              await refreshHashRules();
-              setBanner({ kind: 'success', message: 'Hash rule deleted.' });
-            } catch (err: unknown) {
-              setBanner({ kind: 'error', message: `Failed to delete hash rule: ${String((err as Error)?.message ?? err)}` });
-            }
-          }}
+      render: (state: string) => (
+        <EuiBadge
+          color={
+            state === 'applied'
+              ? 'success'
+              : state === 'pending'
+                ? 'warning'
+                : state === 'failed'
+                  ? 'danger'
+                  : 'hollow'
+          }
         >
-          Delete
-        </EuiButtonEmpty>
+          {state}
+        </EuiBadge>
       ),
+    },
+    {
+      field: 'full_bundle_version',
+      name: 'Full Bundle Version',
+      render: (value?: number) => (value !== undefined ? String(value) : '-'),
+    },
+    {
+      field: 'custom_bundle_version',
+      name: 'Custom Bundle Version',
+      render: (value?: number) => (value !== undefined ? String(value) : '-'),
+    },
+    {
+      field: 'last_reported',
+      name: 'Last Reported',
+      render: (value?: string) => (value ? new Date(value).toLocaleString() : '-'),
+    },
+    {
+      field: 'error',
+      name: 'Error',
+      render: (value?: string) => value || '-',
     },
   ];
 
@@ -1171,7 +1279,14 @@ export const XdrDefenseApp: React.FC<XdrDefenseAppProps> = ({ http, notification
             <EuiFlyoutFooter>
               <EuiFlexGroup justifyContent="spaceBetween">
                 <EuiFlexItem grow={false}>
-                  <EuiButtonEmpty onClick={() => setDrawerOpen('none')}>Cancel</EuiButtonEmpty>
+                  <EuiButtonEmpty
+                    onClick={() => {
+                      setHashFormErrors({});
+                      setDrawerOpen('none');
+                    }}
+                  >
+                    Cancel
+                  </EuiButtonEmpty>
                 </EuiFlexItem>
                 <EuiFlexItem grow={false}>
                   <EuiButton
@@ -1213,8 +1328,6 @@ export const XdrDefenseApp: React.FC<XdrDefenseAppProps> = ({ http, notification
   const renderHashesTab = () => {
     const status = malwareBazaarStatus;
     const hashSyncing = isSyncingMalwareBazaar || status?.status === 'processing';
-    const activeMode = status?.mode ?? (status?.last_query_mode === 'daily_full_csv_export' ? 'daily_full_csv' : 'malwarebazaar_api');
-    const isDailyFullMode = activeMode === 'daily_full_csv';
     const hashSyncBadgeColor =
       status?.status === 'failed'
         ? 'danger'
@@ -1223,22 +1336,7 @@ export const XdrDefenseApp: React.FC<XdrDefenseAppProps> = ({ http, notification
           : status?.status === 'processing'
             ? 'warning'
             : 'hollow';
-    const hashSyncButtonLabel = hashSyncing
-      ? status?.phase === 'requesting_export'
-        ? 'Requesting export'
-        : status?.phase === 'preparing_download'
-          ? 'Preparing download'
-          : status?.phase === 'importing'
-            ? isDailyFullMode
-              ? 'Importing daily export'
-              : 'Syncing Hashes'
-            : isDailyFullMode
-              ? 'Downloading daily export'
-              : 'Downloading feed'
-      : 'Sync MalwareBazaar Hash Feed';
-    const selectedList = [...selectedHashIds];
-    const hasSelection = selectedList.length > 0;
-    const selectedRules = hashRules.filter((r) => selectedHashIds.has(r.id));
+    const rolloutCurrentPage = Math.min(hashRolloutPageIndex, Math.max(0, hashRolloutTotalPages - 1));
 
     return (
       <>
@@ -1279,70 +1377,23 @@ export const XdrDefenseApp: React.FC<XdrDefenseAppProps> = ({ http, notification
               )}
             </EuiFlexItem>
             <EuiFlexItem grow={false}>
-              <EuiFlexGroup gutterSize="s">
+              <EuiFlexGroup gutterSize="s" alignItems="center">
                 <EuiFlexItem grow={false}>
                   <EuiButtonIcon
                     iconType="gear"
+                    size="m"
                     aria-label="Configure MalwareBazaar API key"
-                    onClick={() => setDrawerOpen('malwarebazaar-config')}
+                    onClick={() => {
+                      setDrawerOpen('malwarebazaar-config');
+                      loadMbAutoUpdateSettings();
+                    }}
                   />
                 </EuiFlexItem>
                 <EuiFlexItem grow={false}>
                   <EuiButton
                     fill
                     isDisabled={hashSyncing}
-                    isLoading={hashSyncing && !isDailyFullMode}
-                    onClick={async () => {
-                      if (hashSyncing) return;
-                      setIsSyncingMalwareBazaar(true);
-                      setBanner(null);
-                      try {
-                        const result = (await http.post('/api/xdr-defense/hashes/malwarebazaar/sync', {
-                          body: JSON.stringify({}),
-                        })) as {
-                          query_mode: string;
-                          mode?: string;
-                          upstream_records: number;
-                          attempted?: number;
-                          new_hashes: number;
-                          total_hashes: number;
-                          imported: number;
-                          unchanged: number;
-                          load_failures: number;
-                          errors: string[];
-                        };
-                        await refreshAll();
-                        const errorText = Array.isArray(result.errors) && result.errors.length > 0 ? `\nErrors:\n${result.errors.join('\n')}` : '';
-                        notifications.toasts.addSuccess(
-                          `MalwareBazaar API sync complete. Added ${result.new_hashes} new hashes, stored ${result.total_hashes} total.`
-                        );
-                        setBanner({
-                          kind: 'success',
-                          message: `MalwareBazaar hash API sync completed. Attempted ${result.attempted ?? result.upstream_records}, upstream records ${result.upstream_records}, new hashes ${result.new_hashes}, imported ${result.imported}, unchanged ${result.unchanged}, load failures ${result.load_failures}.${errorText}`,
-                        });
-                      } catch (err: unknown) {
-                        const statusCode = Number((err as any)?.body?.statusCode ?? (err as any)?.statusCode ?? 0);
-                        if (statusCode === 409) {
-                          await refreshMalwareBazaarStatus();
-                          notifications.toasts.addWarning({ title: 'MalwareBazaar sync already running', text: 'Another MalwareBazaar sync is already in progress.' });
-                          setBanner({ kind: 'warning', message: 'MalwareBazaar sync already running. The current sync will continue in the background.' });
-                        } else {
-                          notifications.toasts.addDanger({ title: 'Unable to sync MalwareBazaar hashes', text: (err as Error)?.message });
-                          setBanner({ kind: 'error', message: `Failed to sync MalwareBazaar hashes: ${String((err as Error)?.message ?? err)}` });
-                        }
-                      } finally {
-                        await refreshMalwareBazaarStatus();
-                        setIsSyncingMalwareBazaar(false);
-                      }
-                    }}
-                  >
-                    {hashSyncButtonLabel}
-                  </EuiButton>
-                </EuiFlexItem>
-                <EuiFlexItem grow={false}>
-                  <EuiButton
-                    isDisabled={hashSyncing}
-                    isLoading={hashSyncing && isDailyFullMode}
+                    isLoading={hashSyncing}
                     onClick={async () => {
                       if (hashSyncing) return;
                       setIsSyncingMalwareBazaar(true);
@@ -1399,7 +1450,85 @@ export const XdrDefenseApp: React.FC<XdrDefenseAppProps> = ({ http, notification
                   </EuiButton>
                 </EuiFlexItem>
                 <EuiFlexItem grow={false}>
-                  <EuiButton onClick={() => setDrawerOpen('hashes')}>Add Custom Hashes</EuiButton>
+                  <EuiButton
+                    onClick={() => {
+                      setHashFormErrors({});
+                      setHashForm(createEmptyHashForm());
+                      setDrawerOpen('hashes');
+                    }}
+                  >
+                    Add Custom Hashes
+                  </EuiButton>
+                </EuiFlexItem>
+                <EuiFlexItem grow={false}>
+                  <EuiButton
+                    isLoading={isRollingOutHashes}
+                    isDisabled={isRollingOutHashes}
+                    onClick={async () => {
+                      if (isRollingOutHashes) return;
+                      setIsRollingOutHashes(true);
+                      setBanner(null);
+                      try {
+                        const result = (await http.post('/api/xdr-defense/hashes/rollout', {
+                          body: JSON.stringify({ policy_id: 'global-default' }),
+                        })) as HashRolloutResponse;
+                        await refreshBundleMetadata();
+                        await refreshMalwareBazaarStatus();
+                        await refreshHashRolloutStatus();
+                        const bundleVersion = result.bundle_version ?? 'n/a';
+                        const ruleCount = result.rule_count ?? 0;
+                        notifications.toasts.addSuccess(`Hash rollout triggered. Bundle version ${bundleVersion}, rules ${ruleCount}.`);
+                        setBanner({
+                          kind: 'success',
+                          message: result.message
+                            ? `${result.message} Bundle version ${bundleVersion}, rules ${ruleCount}.`
+                            : `Hash rollout triggered. Bundle version ${bundleVersion}, rules ${ruleCount}.`,
+                        });
+                      } catch (err: unknown) {
+                        notifications.toasts.addDanger({
+                          title: 'Unable to roll out hashes to all agents',
+                          text: (err as Error)?.message,
+                        });
+                        setBanner({ kind: 'error', message: `Failed to roll out hashes to all agents: ${String((err as Error)?.message ?? err)}` });
+                      } finally {
+                        setIsRollingOutHashes(false);
+                      }
+                    }}
+                  >
+                    Rollout Hashes to All Agents
+                  </EuiButton>
+                </EuiFlexItem>
+                <EuiFlexItem grow={false}>
+                  <EuiButton
+                    isLoading={isRetryingHashRollout}
+                    isDisabled={isRetryingHashRollout}
+                    onClick={async () => {
+                      if (isRetryingHashRollout) return;
+                      setIsRetryingHashRollout(true);
+                      setBanner(null);
+                      try {
+                        const result = (await http.post('/api/xdr-defense/hashes/rollouts/retry', {
+                          body: JSON.stringify({}),
+                        })) as HashRolloutRetryResponse;
+                        await refreshHashRolloutStatus();
+                        notifications.toasts.addSuccess('Hash rollout retry requested.');
+                        setBanner({
+                          kind: 'success',
+                          message: `${result.message} Overlay version ${result.overlay_bundle_version}, pending custom entries ${result.pending_custom_entries}.`,
+                        });
+                      } catch (err: unknown) {
+                        notifications.toasts.addDanger({
+                          title: 'Unable to retry hash rollout',
+                          text: (err as Error)?.message,
+                        });
+                        setBanner({ kind: 'error', message: `Failed to retry hash rollout: ${String((err as Error)?.message ?? err)}` });
+                      } finally {
+                        setIsRetryingHashRollout(false);
+                      }
+                    }}
+                  >
+                    Retry Hash Rollout
+                  </EuiButton>
                 </EuiFlexItem>
               </EuiFlexGroup>
             </EuiFlexItem>
@@ -1409,128 +1538,39 @@ export const XdrDefenseApp: React.FC<XdrDefenseAppProps> = ({ http, notification
         <EuiSpacer size="m" />
 
         <EuiPanel>
-          <EuiTitle size="s"><h3>Hash rules</h3></EuiTitle>
+          <EuiTitle size="s"><h3>Hash Rollout Status</h3></EuiTitle>
           <EuiSpacer size="s" />
 
           <EuiFlexGroup alignItems="center" justifyContent="spaceBetween" gutterSize="s" wrap>
             <EuiFlexItem grow={false}>
-              <EuiFlexGroup alignItems="center" gutterSize="s" wrap>
-                <EuiFlexItem grow={false}>
-                  <EuiButton
-                    size="s"
-                    isDisabled={!hasSelection || isHashesBusy}
-                    isLoading={isHashesBusy}
-                    onClick={async () => {
-                      if (!hasSelection || isHashesBusy) return;
-                      setIsHashesBusy(true);
-                      setBanner(null);
-                      let ok = 0; let fail = 0;
-                      for (const id of selectedList) {
-                        try {
-                          await http.put(`/api/xdr-defense/hashes/rules/${encodeURIComponent(id)}`, { body: JSON.stringify({ enabled: true }) });
-                          ok++;
-                        } catch { fail++; }
-                      }
-                      await refreshHashRules();
-                      setIsHashesBusy(false);
-                      setBanner({ kind: 'success', message: `Enabled ${ok} hash rule(s)${fail > 0 ? `, failed ${fail}` : ''}.` });
-                    }}
-                  >
-                    Enable
-                  </EuiButton>
-                </EuiFlexItem>
-                <EuiFlexItem grow={false}>
-                  <EuiButton
-                    size="s"
-                    isDisabled={!hasSelection || isHashesBusy}
-                    isLoading={isHashesBusy}
-                    onClick={async () => {
-                      if (!hasSelection || isHashesBusy) return;
-                      setIsHashesBusy(true);
-                      setBanner(null);
-                      let ok = 0; let fail = 0;
-                      for (const id of selectedList) {
-                        try {
-                          await http.put(`/api/xdr-defense/hashes/rules/${encodeURIComponent(id)}`, { body: JSON.stringify({ enabled: false }) });
-                          ok++;
-                        } catch { fail++; }
-                      }
-                      await refreshHashRules();
-                      setIsHashesBusy(false);
-                      setBanner({ kind: 'success', message: `Disabled ${ok} hash rule(s)${fail > 0 ? `, failed ${fail}` : ''}.` });
-                    }}
-                  >
-                    Disable
-                  </EuiButton>
-                </EuiFlexItem>
-                <EuiFlexItem grow={false}>
-                  <EuiButton
-                    color="danger"
-                    fill
-                    size="s"
-                    isDisabled={!hasSelection || isHashesBusy}
-                    isLoading={isHashesBusy}
-                    onClick={async () => {
-                      if (!hasSelection || isHashesBusy) return;
-                      if (!window.confirm(`Delete ${selectedList.length} selected hash rule(s)?`)) return;
-                      setIsHashesBusy(true);
-                      setBanner(null);
-                      let deleted = 0; let failed = 0;
-                      for (const rule of selectedRules) {
-                        try {
-                          await http.delete(`/api/xdr-defense/hashes/rules/${encodeURIComponent(rule.id)}`);
-                          deleted++;
-                        } catch { failed++; }
-                      }
-                      setSelectedHashIds(new Set());
-                      await refreshHashRules();
-                      setIsHashesBusy(false);
-                      setBanner({ kind: 'success', message: `Bulk delete completed. Deleted ${deleted}${failed > 0 ? `, failed ${failed}` : ''}.` });
-                    }}
-                  >
-                    Delete
-                  </EuiButton>
-                </EuiFlexItem>
-                {hasSelection && (
-                  <EuiFlexItem grow={false}>
-                    <EuiText size="xs" color="subdued"><p>{selectedList.length} selected</p></EuiText>
-                  </EuiFlexItem>
-                )}
-              </EuiFlexGroup>
+              <EuiText size="s" color="subdued">
+                <p>
+                  Agent rollout state is based on per-agent reports. Agents without recent reports are marked
+                  offline/unknown (stale after {hashRolloutStaleAfterMinutes} minutes).
+                </p>
+              </EuiText>
             </EuiFlexItem>
             <EuiFlexItem grow={false}>
               <EuiButtonEmpty
                 size="xs"
                 onClick={async () => {
                   await refreshMalwareBazaarStatus();
+                  await refreshHashRolloutStatus();
                 }}
               >
-                Refresh Sync Status
+                Refresh Rollout Status
               </EuiButtonEmpty>
             </EuiFlexItem>
           </EuiFlexGroup>
 
-          <EuiHorizontalRule margin="s" />
-
-          <EuiFieldSearch
-            value={hashSearchQuery}
-            onChange={(e) => {
-              setHashSearchQuery(e.target.value);
-              setHashPageIndex(0);
-            }}
-            placeholder="Search hashes, file names, signatures, reporter..."
-            fullWidth
-            aria-label="Search indexed hash values and metadata"
-          />
-
           <EuiSpacer size="m" />
 
           <div style={{ overflowX: 'auto', overflowY: 'auto', maxHeight: '55vh' }}>
-            <div style={{ display: 'inline-block', minWidth: 1280 }}>
+            <div style={{ display: 'inline-block', minWidth: 1400 }}>
               <EuiInMemoryTable
-                itemId="id"
-                items={pagedHashRules}
-                columns={hashColumns as any}
+                itemId={(row: HashRolloutStatusRow) => `${row.agent}-${row.policy}`}
+                items={hashRolloutRows}
+                columns={hashRolloutColumns as any}
                 loading={isLoading}
                 pagination={false}
                 sorting={false}
@@ -1549,21 +1589,24 @@ export const XdrDefenseApp: React.FC<XdrDefenseAppProps> = ({ http, notification
                 <EuiFlexItem grow={false}>
                   <EuiSelect
                     compressed
-                    value={String(hashPageSize)}
+                      value={String(hashRolloutPageSize)}
                     onChange={(e) => {
-                      setHashPageSize(Number(e.target.value));
-                      setHashPageIndex(0);
+                        setHashRolloutPageSize(Number(e.target.value));
+                        setHashRolloutPageIndex(0);
                     }}
                     options={pageSizeOptions.map((o) => ({ value: String(o.value), text: o.text }))}
                   />
                 </EuiFlexItem>
+                  <EuiFlexItem grow={false}>
+                    <EuiText size="s" color="subdued"><span>{hashRolloutTotal} agent entries</span></EuiText>
+                  </EuiFlexItem>
               </EuiFlexGroup>
             </EuiFlexItem>
             <EuiFlexItem grow={false}>
               <EuiPagination
-                pageCount={hashTotalPages}
-                activePage={hashCurrentPage}
-                onPageClick={setHashPageIndex}
+                  pageCount={hashRolloutTotalPages}
+                  activePage={rolloutCurrentPage}
+                  onPageClick={setHashRolloutPageIndex}
               />
             </EuiFlexItem>
           </EuiFlexGroup>
@@ -1571,65 +1614,266 @@ export const XdrDefenseApp: React.FC<XdrDefenseAppProps> = ({ http, notification
 
         {/* Add hashes flyout */}
         {drawerOpen === 'hashes' && (
-          <EuiFlyout onClose={() => setDrawerOpen('none')} size="s" ownFocus>
+          <EuiFlyout
+            onClose={() => {
+              setHashFormErrors({});
+              setDrawerOpen('none');
+            }}
+            size="s"
+            ownFocus
+          >
             <EuiFlyoutHeader hasBorder>
-              <EuiTitle size="m"><h2>Add Custom Hash Content</h2></EuiTitle>
+              <EuiTitle size="m"><h2>Add Custom Hash</h2></EuiTitle>
             </EuiFlyoutHeader>
             <EuiFlyoutBody>
+              <EuiCallOut size="s" title="Stored in .xdr-defense-hashes with source=custom">
+                <p>After saving a custom hash, click Rollout Hashes to All Agents to publish the refreshed hash bundle immediately.</p>
+              </EuiCallOut>
+              <EuiSpacer size="m" />
               <EuiFlexGroup>
                 <EuiFlexItem>
                   <EuiFormRow label="Name">
-                    <EuiFieldText value={hashFormName} onChange={(e) => setHashFormName(e.target.value)} placeholder="rule name" />
+                    <EuiFieldText value={hashForm.name} onChange={(e) => setHashForm((prev) => ({ ...prev, name: e.target.value }))} placeholder="Custom malware hash" />
                   </EuiFormRow>
                 </EuiFlexItem>
                 <EuiFlexItem grow={false} style={{ width: 180 }}>
                   <EuiFormRow label="Severity">
-                    <EuiSelect options={severityOptions} value={hashFormSeverity} onChange={(e) => setHashFormSeverity(e.target.value)} />
+                    <EuiSelect options={severityOptions} value={hashForm.severity} onChange={(e) => setHashForm((prev) => ({ ...prev, severity: e.target.value }))} />
                   </EuiFormRow>
                 </EuiFlexItem>
               </EuiFlexGroup>
               <EuiSpacer size="m" />
-              <EuiFormRow label="Tags (comma-separated)">
-                <EuiFieldText value={hashFormTags} onChange={(e) => setHashFormTags(e.target.value)} placeholder="malware, custom" />
-              </EuiFormRow>
+              <EuiFlexGroup>
+                <EuiFlexItem grow={false}>
+                  <EuiSwitch
+                    label="Enabled"
+                    checked={hashForm.enabled}
+                    onChange={(e) => setHashForm((prev) => ({ ...prev, enabled: e.target.checked }))}
+                  />
+                </EuiFlexItem>
+                <EuiFlexItem>
+                  <EuiFormRow label="Tags (comma-separated)">
+                    <EuiFieldText value={hashForm.tags} onChange={(e) => setHashForm((prev) => ({ ...prev, tags: e.target.value }))} placeholder="malware, custom" />
+                  </EuiFormRow>
+                </EuiFlexItem>
+              </EuiFlexGroup>
               <EuiSpacer size="m" />
-              <EuiFormRow label="Hash Content (one per line)">
-                <EuiTextArea
-                  value={hashFormContent}
-                  onChange={(e) => setHashFormContent(e.target.value)}
-                  placeholder={'sha256:6f2af3f7d9da2e9b9841c843f4f89d8f22d3a3f75cc9e70b2dd76378905c37da\nmd5:d41d8cd98f00b204e9800998ecf8427e'}
-                  style={{ fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', minHeight: 120 }}
+              <EuiTitle size="xs"><h3>Hash Values</h3></EuiTitle>
+              <EuiSpacer size="s" />
+              <EuiFormRow
+                label="SHA256"
+                isInvalid={Boolean(hashFormErrors.sha256_hash)}
+                error={hashFormErrors.sha256_hash ? [hashFormErrors.sha256_hash] : undefined}
+              >
+                <EuiFieldText
+                  isInvalid={Boolean(hashFormErrors.sha256_hash)}
+                  value={hashForm.sha256_hash}
+                  onChange={(e) => {
+                    const value = e.target.value;
+                    setHashForm((prev) => ({ ...prev, sha256_hash: value }));
+                    setHashFormErrors((prev) => {
+                      const next = { ...prev };
+                      delete next.sha256_hash;
+                      return next;
+                    });
+                  }}
+                  placeholder="64 hex characters"
                 />
               </EuiFormRow>
+              <EuiFlexGroup>
+                <EuiFlexItem>
+                  <EuiFormRow
+                    label="MD5"
+                    isInvalid={Boolean(hashFormErrors.md5_hash)}
+                    error={hashFormErrors.md5_hash ? [hashFormErrors.md5_hash] : undefined}
+                  >
+                    <EuiFieldText
+                      isInvalid={Boolean(hashFormErrors.md5_hash)}
+                      value={hashForm.md5_hash}
+                      onChange={(e) => {
+                        const value = e.target.value;
+                        setHashForm((prev) => ({ ...prev, md5_hash: value }));
+                        setHashFormErrors((prev) => {
+                          const next = { ...prev };
+                          delete next.md5_hash;
+                          return next;
+                        });
+                      }}
+                      placeholder="32 hex characters"
+                    />
+                  </EuiFormRow>
+                </EuiFlexItem>
+                <EuiFlexItem>
+                  <EuiFormRow
+                    label="SHA1"
+                    isInvalid={Boolean(hashFormErrors.sha1_hash)}
+                    error={hashFormErrors.sha1_hash ? [hashFormErrors.sha1_hash] : undefined}
+                  >
+                    <EuiFieldText
+                      isInvalid={Boolean(hashFormErrors.sha1_hash)}
+                      value={hashForm.sha1_hash}
+                      onChange={(e) => {
+                        const value = e.target.value;
+                        setHashForm((prev) => ({ ...prev, sha1_hash: value }));
+                        setHashFormErrors((prev) => {
+                          const next = { ...prev };
+                          delete next.sha1_hash;
+                          return next;
+                        });
+                      }}
+                      placeholder="40 hex characters"
+                    />
+                  </EuiFormRow>
+                </EuiFlexItem>
+              </EuiFlexGroup>
+              <EuiSpacer size="m" />
+              <EuiTitle size="xs"><h3>Metadata</h3></EuiTitle>
+              <EuiSpacer size="s" />
+              <EuiFlexGroup>
+                <EuiFlexItem>
+                  <EuiFormRow label="File name">
+                    <EuiFieldText value={hashForm.file_name} onChange={(e) => setHashForm((prev) => ({ ...prev, file_name: e.target.value }))} placeholder="sample.exe" />
+                  </EuiFormRow>
+                </EuiFlexItem>
+                <EuiFlexItem>
+                  <EuiFormRow label="Signature">
+                    <EuiFieldText value={hashForm.signature} onChange={(e) => setHashForm((prev) => ({ ...prev, signature: e.target.value }))} placeholder="Malware family / signature" />
+                  </EuiFormRow>
+                </EuiFlexItem>
+              </EuiFlexGroup>
+              <EuiFlexGroup>
+                <EuiFlexItem>
+                  <EuiFormRow label="Reporter">
+                    <EuiFieldText value={hashForm.reporter} onChange={(e) => setHashForm((prev) => ({ ...prev, reporter: e.target.value }))} placeholder="Analyst or source" />
+                  </EuiFormRow>
+                </EuiFlexItem>
+                <EuiFlexItem>
+                  <EuiFormRow label="File type guess">
+                    <EuiFieldText value={hashForm.file_type_guess} onChange={(e) => setHashForm((prev) => ({ ...prev, file_type_guess: e.target.value }))} placeholder="exe / dll / script" />
+                  </EuiFormRow>
+                </EuiFlexItem>
+              </EuiFlexGroup>
+              <EuiFlexGroup>
+                <EuiFlexItem>
+                  <EuiFormRow label="MIME type">
+                    <EuiFieldText value={hashForm.mime_type} onChange={(e) => setHashForm((prev) => ({ ...prev, mime_type: e.target.value }))} placeholder="application/x-dosexec" />
+                  </EuiFormRow>
+                </EuiFlexItem>
+                <EuiFlexItem>
+                  <EuiFormRow label="VT percent">
+                    <EuiFieldText value={hashForm.vtpercent} onChange={(e) => setHashForm((prev) => ({ ...prev, vtpercent: e.target.value }))} placeholder="70" />
+                  </EuiFormRow>
+                </EuiFlexItem>
+              </EuiFlexGroup>
+              <EuiFlexGroup>
+                <EuiFlexItem>
+                  <EuiFormRow label="ClamAV">
+                    <EuiFieldText value={hashForm.clamav} onChange={(e) => setHashForm((prev) => ({ ...prev, clamav: e.target.value }))} placeholder="Win.Trojan.Sample" />
+                  </EuiFormRow>
+                </EuiFlexItem>
+                <EuiFlexItem>
+                  <EuiFormRow
+                    label="imphash"
+                    isInvalid={Boolean(hashFormErrors.imphash)}
+                    error={hashFormErrors.imphash ? [hashFormErrors.imphash] : undefined}
+                  >
+                    <EuiFieldText
+                      isInvalid={Boolean(hashFormErrors.imphash)}
+                      value={hashForm.imphash}
+                      onChange={(e) => {
+                        const value = e.target.value;
+                        setHashForm((prev) => ({ ...prev, imphash: value }));
+                        setHashFormErrors((prev) => {
+                          const next = { ...prev };
+                          delete next.imphash;
+                          return next;
+                        });
+                      }}
+                      placeholder="32 hex characters"
+                    />
+                  </EuiFormRow>
+                </EuiFlexItem>
+              </EuiFlexGroup>
+              <EuiFlexGroup>
+                <EuiFlexItem>
+                  <EuiFormRow label="ssdeep">
+                    <EuiFieldText value={hashForm.ssdeep} onChange={(e) => setHashForm((prev) => ({ ...prev, ssdeep: e.target.value }))} placeholder="ssdeep fuzzy hash" />
+                  </EuiFormRow>
+                </EuiFlexItem>
+                <EuiFlexItem>
+                  <EuiFormRow label="TLSH">
+                    <EuiFieldText value={hashForm.tlsh} onChange={(e) => setHashForm((prev) => ({ ...prev, tlsh: e.target.value }))} placeholder="T1..." />
+                  </EuiFormRow>
+                </EuiFlexItem>
+              </EuiFlexGroup>
             </EuiFlyoutBody>
             <EuiFlyoutFooter>
               <EuiFlexGroup justifyContent="spaceBetween">
                 <EuiFlexItem grow={false}>
-                  <EuiButtonEmpty onClick={() => setDrawerOpen('none')}>Cancel</EuiButtonEmpty>
+                  <EuiButtonEmpty
+                    onClick={() => {
+                      setHashFormErrors({});
+                      setDrawerOpen('none');
+                    }}
+                  >
+                    Cancel
+                  </EuiButtonEmpty>
                 </EuiFlexItem>
                 <EuiFlexItem grow={false}>
                   <EuiButton
                     fill
                     onClick={async () => {
                       setBanner(null);
+                      const localErrors = validateCustomHashForm(hashForm);
+                      if (Object.keys(localErrors).length > 0) {
+                        setHashFormErrors(localErrors);
+                        return;
+                      }
+
+                      const payload: Record<string, unknown> = {
+                        enabled: hashForm.enabled,
+                        severity: hashForm.severity,
+                        tags: hashForm.tags.split(',').map((t) => t.trim()).filter((t) => t.length > 0),
+                      };
+
+                      const assignOptionalTrimmed = (key: HashTextField) => {
+                        const value = hashForm[key].trim();
+                        if (value.length > 0) {
+                          payload[key] = value;
+                        }
+                      };
+
+                      assignOptionalTrimmed('name');
+                      assignOptionalTrimmed('sha256_hash');
+                      assignOptionalTrimmed('md5_hash');
+                      assignOptionalTrimmed('sha1_hash');
+                      assignOptionalTrimmed('reporter');
+                      assignOptionalTrimmed('file_name');
+                      assignOptionalTrimmed('file_type_guess');
+                      assignOptionalTrimmed('mime_type');
+                      assignOptionalTrimmed('signature');
+                      assignOptionalTrimmed('clamav');
+                      assignOptionalTrimmed('vtpercent');
+                      assignOptionalTrimmed('imphash');
+                      assignOptionalTrimmed('ssdeep');
+                      assignOptionalTrimmed('tlsh');
+
                       try {
+                        setHashFormErrors({});
                         await http.post('/api/xdr-defense/hashes/rules', {
-                          body: JSON.stringify({
-                            name: hashFormName,
-                            content: hashFormContent,
-                            severity: hashFormSeverity,
-                            tags: hashFormTags.split(',').map((t) => t.trim()).filter((t) => t.length > 0),
-                          }),
+                          body: JSON.stringify(payload),
                         });
                         setDrawerOpen('none');
-                        setHashFormName('');
-                        setHashFormContent('');
-                        setHashFormSeverity('medium');
-                        setHashFormTags('');
+                        setHashForm(createEmptyHashForm());
+                        setHashFormErrors({});
                         await refreshHashRules();
-                        setBanner({ kind: 'success', message: 'Custom hash content added.' });
+                        setBanner({ kind: 'success', message: 'Custom hash saved to .xdr-defense-hashes.' });
                       } catch (err: unknown) {
-                        setBanner({ kind: 'error', message: `Failed to add hash content: ${String((err as Error)?.message ?? err)}` });
+                        const backendFieldErrors = parseHashFieldErrors(err);
+                        if (Object.keys(backendFieldErrors).length > 0) {
+                          setHashFormErrors(backendFieldErrors);
+                        }
+                        setBanner({ kind: 'error', message: `Failed to save custom hash: ${customHashErrorMessage(err)}` });
                       }
                     }}
                   >
@@ -1643,16 +1887,19 @@ export const XdrDefenseApp: React.FC<XdrDefenseAppProps> = ({ http, notification
 
         {/* MalwareBazaar config flyout */}
         {drawerOpen === 'malwarebazaar-config' && (
-          <EuiFlyout onClose={() => setDrawerOpen('none')} size="s" ownFocus>
+          <EuiFlyout onClose={() => setDrawerOpen('none')} size="m" ownFocus>
             <EuiFlyoutHeader hasBorder>
-              <EuiTitle size="m"><h2>Configure MalwareBazaar API Key</h2></EuiTitle>
+              <EuiTitle size="m"><h2>MalwareBazaar Configuration</h2></EuiTitle>
             </EuiFlyoutHeader>
             <EuiFlyoutBody>
+              {/* Section 1: API Key */}
+              <EuiTitle size="s"><h3>MalwareBazaar API Key</h3></EuiTitle>
+              <EuiSpacer size="s" />
               <EuiText size="s" color="subdued">
                 <p>The key is shown only at entry time. Saving a new value overwrites the existing encrypted key in xdr-defense storage.</p>
               </EuiText>
               <EuiSpacer size="m" />
-              <EuiFormRow label="MalwareBazaar API Key">
+              <EuiFormRow label="API Key">
                 <EuiFieldText
                   type="password"
                   value={malwareBazaarApiKey}
@@ -1664,12 +1911,8 @@ export const XdrDefenseApp: React.FC<XdrDefenseAppProps> = ({ http, notification
               <EuiText size="xs" color="subdued">
                 <p>{status?.api_key_updated_at ? `Last updated ${new Date(status.api_key_updated_at).toLocaleString()}` : 'No key saved yet.'}</p>
               </EuiText>
-            </EuiFlyoutBody>
-            <EuiFlyoutFooter>
-              <EuiFlexGroup justifyContent="spaceBetween">
-                <EuiFlexItem grow={false}>
-                  <EuiButtonEmpty onClick={() => setDrawerOpen('none')}>Cancel</EuiButtonEmpty>
-                </EuiFlexItem>
+              <EuiSpacer size="s" />
+              <EuiFlexGroup justifyContent="flexEnd">
                 <EuiFlexItem grow={false}>
                   <EuiButton
                     fill
@@ -1679,7 +1922,6 @@ export const XdrDefenseApp: React.FC<XdrDefenseAppProps> = ({ http, notification
                           body: JSON.stringify({ api_key: malwareBazaarApiKey }),
                         });
                         setMalwareBazaarApiKey('');
-                        setDrawerOpen('none');
                         await refreshMalwareBazaarStatus();
                         notifications.toasts.addSuccess('MalwareBazaar API key saved. Future syncs will use the new key.');
                         setBanner({ kind: 'success', message: 'MalwareBazaar API key saved and stored in encrypted plugin state.' });
@@ -1693,6 +1935,140 @@ export const XdrDefenseApp: React.FC<XdrDefenseAppProps> = ({ http, notification
                   </EuiButton>
                 </EuiFlexItem>
               </EuiFlexGroup>
+
+              <EuiHorizontalRule />
+
+              {/* Section 2: Database Update via API */}
+              <EuiTitle size="s"><h3>Database Update via API</h3></EuiTitle>
+              <EuiSpacer size="s" />
+              <EuiText size="s" color="subdued">
+                <p>
+                  Automatically enrich hash records that are missing VirusTotal data by querying MalwareBazaar.
+                  The update targets the records that have no <strong>vtpercent</strong> value, starting with the oldest.
+                  No bundle rollout to agents is triggered.
+                </p>
+              </EuiText>
+              <EuiSpacer size="m" />
+              <EuiFormRow label="Enable automatic updates">
+                <EuiSwitch
+                  label={mbAutoUpdateEnabled ? 'On' : 'Off'}
+                  checked={mbAutoUpdateEnabled}
+                  onChange={(e) => setMbAutoUpdateEnabled(e.target.checked)}
+                />
+              </EuiFormRow>
+              <EuiSpacer size="m" />
+              <EuiFormRow
+                label="API requests per day"
+                helpText={`= ${mbCallsPerWindow} API call${mbCallsPerWindow === 1 ? '' : 's'} per 5-minute window`}
+              >
+                <EuiFieldNumber
+                  min={1}
+                  max={100000}
+                  value={mbRequestsPerDayInput}
+                  onChange={(e) => {
+                    const raw = e.target.value;
+                    setMbRequestsPerDayInput(raw);
+                    const parsed = Number(raw);
+                    if (!Number.isFinite(parsed) || raw.trim() === '') {
+                      setMbCallsPerWindow(0);
+                      return;
+                    }
+                    const clamped = Math.max(1, Math.min(100000, Math.floor(parsed)));
+                    setMbCallsPerWindow(Math.floor(clamped * 5 / (24 * 60)));
+                  }}
+                  onBlur={() => {
+                    const parsed = Number(mbRequestsPerDayInput);
+                    if (!Number.isFinite(parsed) || mbRequestsPerDayInput.trim() === '') {
+                      setMbRequestsPerDayInput('1000');
+                      setMbCallsPerWindow(Math.floor(1000 * 5 / (24 * 60)));
+                      return;
+                    }
+                    const clamped = Math.max(1, Math.min(100000, Math.floor(parsed)));
+                    setMbRequestsPerDayInput(String(clamped));
+                    setMbCallsPerWindow(Math.floor(clamped * 5 / (24 * 60)));
+                  }}
+                />
+              </EuiFormRow>
+              <EuiSpacer size="m" />
+              <EuiFlexGroup justifyContent="spaceBetween" alignItems="center">
+                <EuiFlexItem grow={false}>
+                  <EuiButton
+                    isLoading={mbSyncNowRunning}
+                    onClick={async () => {
+                      setMbSyncNowRunning(true);
+                      try {
+                        const result = (await http.post('/api/xdr-defense/hashes/malwarebazaar/auto-update-sync-now', {
+                          body: JSON.stringify({}),
+                        })) as {
+                          attempted: number;
+                          enriched: number;
+                          message: string;
+                        };
+                        await refreshHashRules();
+                        notifications.toasts.addSuccess(
+                          result.attempted > 0
+                            ? `Sync now completed. 1 lookup executed, ${result.enriched} document updated.`
+                            : result.message
+                        );
+                        setBanner({
+                          kind: 'success',
+                          message:
+                            result.attempted > 0
+                              ? `Database Update via API sync-now completed. Lookups executed: ${result.attempted}, updated documents: ${result.enriched}.`
+                              : result.message,
+                        });
+                      } catch (err: unknown) {
+                        notifications.toasts.addDanger({ title: 'Unable to run sync now', text: (err as Error)?.message });
+                        setBanner({ kind: 'error', message: `Sync now failed: ${String((err as Error)?.message ?? err)}` });
+                      } finally {
+                        setMbSyncNowRunning(false);
+                      }
+                    }}
+                  >
+                    Sync Now
+                  </EuiButton>
+                </EuiFlexItem>
+                <EuiFlexItem grow={false}>
+                  <EuiButton
+                    fill
+                    isLoading={mbSettingsSaving}
+                    onClick={async () => {
+                      const parsed = Number(mbRequestsPerDayInput);
+                      if (!Number.isFinite(parsed) || mbRequestsPerDayInput.trim() === '') {
+                        notifications.toasts.addDanger({
+                          title: 'Invalid requests per day',
+                          text: 'Enter a number between 1 and 100000 before saving.'
+                        });
+                        return;
+                      }
+
+                      const requestsPerDay = Math.max(1, Math.min(100000, Math.floor(parsed)));
+                      setMbRequestsPerDayInput(String(requestsPerDay));
+                      setMbCallsPerWindow(Math.floor(requestsPerDay * 5 / (24 * 60)));
+
+                      setMbSettingsSaving(true);
+                      try {
+                        await http.post('/api/xdr-defense/hashes/malwarebazaar/auto-update-settings', {
+                          body: JSON.stringify({
+                            enabled: mbAutoUpdateEnabled,
+                            requests_per_day: requestsPerDay
+                          }),
+                        });
+                        notifications.toasts.addSuccess('Auto-update settings saved.');
+                      } catch (err: unknown) {
+                        notifications.toasts.addDanger({ title: 'Unable to save auto-update settings', text: (err as Error)?.message });
+                      } finally {
+                        setMbSettingsSaving(false);
+                      }
+                    }}
+                  >
+                    Save Settings
+                  </EuiButton>
+                </EuiFlexItem>
+              </EuiFlexGroup>
+            </EuiFlyoutBody>
+            <EuiFlyoutFooter>
+              <EuiButtonEmpty onClick={() => setDrawerOpen('none')}>Close</EuiButtonEmpty>
             </EuiFlyoutFooter>
           </EuiFlyout>
         )}

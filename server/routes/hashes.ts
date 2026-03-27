@@ -10,7 +10,6 @@ import {
   deleteHashDocument,
   ensureHashesIndex,
   getHashDocument,
-  isEligibleHashBundleRule,
   listHashRulesIndexed,
   malwareBazaarDocId,
   upsertHashDocument,
@@ -21,10 +20,23 @@ import {
   syncMalwareBazaarDailyFullCsv,
   type MalwareBazaarSample
 } from '../lib/malwarebazaar';
+import {
+  bumpImmediateCustomHashOverlayBundleVersion,
+  clearImmediateCustomHashOverlayState,
+  getImmediateCustomHashOverlayState,
+  isEligibleImmediateCustomHashOverlayDocument,
+  reconcileImmediateCustomHashOverlayState
+} from '../lib/hash_custom_overlay_state';
+import {
+  ensureHashRolloutStatusIndex,
+  ingestHashRolloutStatusReport,
+  listHashRolloutStatus
+} from '../lib/hash_rollout_status';
 import { getMalwareBazaarApiKey, getMalwareBazaarApiKeyStatus, setMalwareBazaarApiKey } from '../lib/secret_store';
 import { getSigningPrivateKey } from '../lib/signing_keys';
-import { getMalwareBazaarSyncState, updateMalwareBazaarSyncState } from '../lib/upstream_sync_store';
+import { getMalwareBazaarSyncState, updateMalwareBazaarSyncState, getMbAutoUpdateSettings, saveMbAutoUpdateSettings } from '../lib/upstream_sync_store';
 import { validateHashContent } from '../lib/hashes_store';
+import { mbAutoUpdateScheduler, callsPerWindow } from '../lib/mb_auto_update';
 
 const { schema } = require('@osd/config-schema');
 
@@ -83,8 +95,8 @@ interface SignedBundleResponse {
 type Severity = 'critical' | 'high' | 'medium' | 'low';
 
 const MALWAREBAZAAR_DEFAULT_RECENT_LIMIT = 100;
-const HASH_BUNDLE_CHUNK_SIZE = 5000;
-const HASH_BUNDLE_SCAN_PAGE_SIZE = 5000;
+const HASH_BUNDLE_CHUNK_SIZE = 1000;
+const HASH_BUNDLE_SCAN_PAGE_SIZE = 10000;
 
 interface DailyHashBundleSnapshot {
   dateVersion: string;
@@ -93,6 +105,7 @@ interface DailyHashBundleSnapshot {
   rules: BundleRuleEntry[];
   activeChecksums: string[];
   totalCriticalHashes: number;
+  includedCriticalSha256Hashes: string[];
 }
 
 let dailyHashBundleSnapshot: DailyHashBundleSnapshot | null = null;
@@ -256,6 +269,43 @@ function normalizeHash(raw: unknown, length: number): string | undefined {
   return re.test(value) ? value : undefined;
 }
 
+type FieldErrorMap = Record<string, string[]>;
+
+function addFieldError(fieldErrors: FieldErrorMap, field: string, message: string): void {
+  if (!fieldErrors[field]) {
+    fieldErrors[field] = [];
+  }
+  fieldErrors[field].push(message);
+}
+
+function hasFieldErrors(fieldErrors: FieldErrorMap): boolean {
+  return Object.keys(fieldErrors).length > 0;
+}
+
+function validateHexHashField(
+  raw: unknown,
+  length: number,
+  field: string,
+  label: string,
+  fieldErrors: FieldErrorMap
+): string | undefined {
+  const value = String(raw ?? '').trim();
+  if (!value) {
+    return undefined;
+  }
+  const re = new RegExp(`^[a-fA-F0-9]{${length}}$`);
+  if (!re.test(value)) {
+    addFieldError(fieldErrors, field, `${label} must be exactly ${length} hexadecimal characters.`);
+    return undefined;
+  }
+  return value.toLowerCase();
+}
+
+function normalizeStoredSeverity(raw: unknown): string {
+  const value = String(raw ?? 'medium').trim().toLowerCase();
+  return value || 'medium';
+}
+
 function severityRank(severity: Severity): number {
   switch (severity) {
     case 'critical':
@@ -287,7 +337,7 @@ function deriveMalwareBazaarSeverity(sample: MalwareBazaarSample): Severity {
   let derived: Severity = 'low';
   const vtpercent = parseVtPercent(sample.vtpercent);
   if (typeof vtpercent === 'number') {
-    if (vtpercent >= 60) {
+    if (vtpercent >= 75) {
       derived = 'critical';
     } else if (vtpercent >= 25) {
       derived = 'high';
@@ -329,16 +379,40 @@ function toDocument(input: {
   return {
     first_seen_utc: cleanString(input.sample.first_seen),
     sha256_hash: input.sha256,
+    sha3_384_hash: normalizeHash(input.sample.sha3_384_hash, 96),
     md5_hash: normalizeHash(input.sample.md5_hash, 32),
     sha1_hash: normalizeHash(input.sample.sha1_hash, 40),
     reporter: cleanString(input.sample.reporter),
     file_name: cleanString(input.sample.file_name),
     file_type_guess: cleanString(input.sample.file_type_guess),
+    file_format: cleanString(input.sample.file_format),
+    file_arch: cleanString(input.sample.file_arch),
     mime_type: cleanString(input.sample.mime_type),
     signature,
     clamav: cleanString(input.sample.clamav),
     vtpercent: cleanString(input.sample.vtpercent),
     imphash: normalizeHash(input.sample.imphash, 32),
+    telfhash: cleanString(input.sample.telfhash),
+    gimphash: cleanString(input.sample.gimphash),
+    magika: cleanString(input.sample.magika),
+    dhash_icon: cleanString(input.sample.dhash_icon),
+    trid: cleanString(input.sample.trid),
+    comment: cleanString(input.sample.comment),
+    archive_pw: cleanString(input.sample.archive_pw),
+    delivery_method: cleanString(input.sample.delivery_method),
+    code_sign: cleanString(input.sample.code_sign),
+    origin_country: cleanString(input.sample.origin_country),
+    anonymous: typeof input.sample.anonymous === 'boolean' ? input.sample.anonymous : undefined,
+    intelligence_uploads:
+      typeof input.sample.intelligence_uploads === 'number' && Number.isFinite(input.sample.intelligence_uploads)
+        ? input.sample.intelligence_uploads
+        : undefined,
+    intelligence_downloads:
+      typeof input.sample.intelligence_downloads === 'number' && Number.isFinite(input.sample.intelligence_downloads)
+        ? input.sample.intelligence_downloads
+        : undefined,
+    intelligence_mail: cleanString(input.sample.intelligence_mail),
+    intelligence_clamav: cleanString(input.sample.intelligence_clamav),
     ssdeep: cleanString(input.sample.ssdeep),
     tlsh: cleanString(input.sample.tlsh),
     source: input.source,
@@ -362,16 +436,34 @@ function toUpdateDocument(doc: HashIndexDocument): Partial<HashIndexDocument> {
   return {
     first_seen_utc: doc.first_seen_utc,
     sha256_hash: doc.sha256_hash,
+    sha3_384_hash: doc.sha3_384_hash,
     md5_hash: doc.md5_hash,
     sha1_hash: doc.sha1_hash,
     reporter: doc.reporter,
     file_name: doc.file_name,
     file_type_guess: doc.file_type_guess,
+    file_format: doc.file_format,
+    file_arch: doc.file_arch,
     mime_type: doc.mime_type,
     signature: doc.signature,
     clamav: doc.clamav,
     vtpercent: doc.vtpercent,
     imphash: doc.imphash,
+    telfhash: doc.telfhash,
+    gimphash: doc.gimphash,
+    magika: doc.magika,
+    dhash_icon: doc.dhash_icon,
+    trid: doc.trid,
+    comment: doc.comment,
+    archive_pw: doc.archive_pw,
+    delivery_method: doc.delivery_method,
+    code_sign: doc.code_sign,
+    origin_country: doc.origin_country,
+    anonymous: doc.anonymous,
+    intelligence_uploads: doc.intelligence_uploads,
+    intelligence_downloads: doc.intelligence_downloads,
+    intelligence_mail: doc.intelligence_mail,
+    intelligence_clamav: doc.intelligence_clamav,
     ssdeep: doc.ssdeep,
     tlsh: doc.tlsh,
     source: doc.source,
@@ -533,6 +625,7 @@ async function performMalwareBazaarSync(client: any): Promise<Record<string, unk
   });
 
   await prebuildDailyHashBundleSnapshotBestEffort(client, { forceRebuild: true });
+  clearImmediateCustomHashOverlayState();
 
   return {
     message: 'MalwareBazaar hash sync completed.',
@@ -723,6 +816,7 @@ async function performMalwareBazaarDailyFullSync(client: any): Promise<Record<st
   });
 
   await prebuildDailyHashBundleSnapshotBestEffort(client, { forceRebuild: true });
+  clearImmediateCustomHashOverlayState();
 
   return {
     message: 'MalwareBazaar daily full CSV hash sync completed.',
@@ -764,7 +858,21 @@ function parseHashLine(lineRaw: string): { sha256?: string; md5?: string; sha1?:
   return null;
 }
 
-function hashYamlChunkContent(items: Array<{ sha256_hash: string; name: string; severity: string; source: string }>): string {
+function buildCustomHashContent(input: { sha256_hash?: string; md5_hash?: string; sha1_hash?: string }): string {
+  const lines: string[] = [];
+  if (input.sha256_hash) {
+    lines.push(`sha256:${input.sha256_hash}`);
+  }
+  if (input.md5_hash) {
+    lines.push(`md5:${input.md5_hash}`);
+  }
+  if (input.sha1_hash) {
+    lines.push(`sha1:${input.sha1_hash}`);
+  }
+  return lines.join('\n');
+}
+
+function hashYamlChunkContent(items: Array<{ sha256_hash: string; name: string }>): string {
   if (items.length === 0) {
     return 'hashes: []\n';
   }
@@ -775,11 +883,30 @@ function hashYamlChunkContent(items: Array<{ sha256_hash: string; name: string; 
     const safeName = /[:#\[\]{},|>&*!?'"\\]/.test(item.name) ? `'${escapedName}'` : item.name;
     lines.push(`  - sha256: ${item.sha256_hash}`);
     lines.push(`    name: ${safeName}`);
-    lines.push(`    severity: ${item.severity}`);
-    lines.push(`    source: ${item.source}`);
   }
 
   return `${lines.join('\n')}\n`;
+}
+
+function signHashBundlePayload(payload: Omit<SignedBundleResponse, 'signature_base64' | 'signed_payload_base64'>): {
+  bundle?: SignedBundleResponse;
+  error?: string;
+} {
+  const keyResult = getSigningPrivateKey();
+  if (!keyResult.ok || !keyResult.privateKey) {
+    return { error: keyResult.error ?? 'Signing key is unavailable.' };
+  }
+
+  const payloadBytes = BufferCtor.from(JSON.stringify(payload), 'utf8');
+  const signature = crypto.sign(null, payloadBytes, keyResult.privateKey);
+
+  return {
+    bundle: {
+      ...payload,
+      signature_base64: signature.toString('base64'),
+      signed_payload_base64: payloadBytes.toString('base64')
+    }
+  };
 }
 
 async function buildDailyHashBundleSnapshot(client: any): Promise<DailyHashBundleSnapshot> {
@@ -792,9 +919,10 @@ async function buildDailyHashBundleSnapshot(client: any): Promise<DailyHashBundl
   const activeChecksums: string[] = [];
 
   let searchAfter: unknown[] | undefined;
-  let chunkRows: Array<{ sha256_hash: string; name: string; severity: string; source: string }> = [];
+  let chunkRows: Array<{ sha256_hash: string; name: string }> = [];
   let chunkSeq = 0;
   let totalCriticalHashes = 0;
+  const includedCriticalSha256Hashes = new Set<string>();
 
   const flushChunk = () => {
     if (chunkRows.length === 0) {
@@ -844,7 +972,7 @@ async function buildDailyHashBundleSnapshot(client: any): Promise<DailyHashBundl
             ]
           }
         },
-        _source: ['sha256_hash', 'name', 'source', 'severity'],
+        _source: ['sha256_hash', 'name'],
         sort: [{ _id: { order: 'asc' } }],
         ...(searchAfter ? { search_after: searchAfter } : {})
       }
@@ -857,15 +985,6 @@ async function buildDailyHashBundleSnapshot(client: any): Promise<DailyHashBundl
 
     for (const hit of hits) {
       const source = hit?._source ?? {};
-      if (!isEligibleHashBundleRule({
-        enabled: source.enabled ?? true,
-        severity: source.severity,
-        source: source.source,
-        validation: { status: source?.validation?.status ?? 'valid' }
-      })) {
-        continue;
-      }
-
       const sha256 = normalizeHash(source.sha256_hash, 64);
       if (!sha256) {
         continue;
@@ -873,10 +992,9 @@ async function buildDailyHashBundleSnapshot(client: any): Promise<DailyHashBundl
 
       chunkRows.push({
         sha256_hash: sha256,
-        name: String(source.name ?? `Malware SHA256 ${sha256.slice(0, 12)}`),
-        severity: 'critical',
-        source: String(source.source ?? 'unknown')
+        name: String(source.name ?? `Malware SHA256 ${sha256.slice(0, 12)}`)
       });
+      includedCriticalSha256Hashes.add(sha256);
       totalCriticalHashes += 1;
 
       if (chunkRows.length >= HASH_BUNDLE_CHUNK_SIZE) {
@@ -901,7 +1019,8 @@ async function buildDailyHashBundleSnapshot(client: any): Promise<DailyHashBundl
     generatedAt,
     rules,
     activeChecksums,
-    totalCriticalHashes
+    totalCriticalHashes,
+    includedCriticalSha256Hashes: [...includedCriticalSha256Hashes].sort((left, right) => left.localeCompare(right))
   };
 }
 
@@ -946,13 +1065,8 @@ async function prebuildDailyHashBundleSnapshotBestEffort(
 }
 
 async function buildSignedHashBundle(client: any, policyId: string): Promise<{ bundle?: SignedBundleResponse; error?: string }> {
-  const keyResult = getSigningPrivateKey();
-  if (!keyResult.ok || !keyResult.privateKey) {
-    return { error: keyResult.error ?? 'Signing key is unavailable.' };
-  }
-
   const snapshot = await ensureDailyHashBundleSnapshot(client);
-  const payload = {
+  return signHashBundlePayload({
     manifest_version: 1 as const,
     policy_id: policyId,
     bundle_version: snapshot.bundleVersion,
@@ -960,18 +1074,82 @@ async function buildSignedHashBundle(client: any, policyId: string): Promise<{ b
     signing_alg: 'ed25519' as const,
     rules: snapshot.rules,
     active_checksums: snapshot.activeChecksums
-  };
+  });
+}
 
-  const payloadBytes = BufferCtor.from(JSON.stringify(payload), 'utf8');
-  const signature = crypto.sign(null, payloadBytes, keyResult.privateKey);
+async function buildSignedImmediateCustomHashOverlayBundle(
+  client: any,
+  policyId: string
+): Promise<{ bundle?: SignedBundleResponse; error?: string }> {
+  let overlayState = getImmediateCustomHashOverlayState();
+  const fullSnapshotSha256 = new Set<string>(dailyHashBundleSnapshot?.includedCriticalSha256Hashes ?? []);
+  const docs = await Promise.all(
+    overlayState.pending_doc_ids.map(async (id) => ({
+      id,
+      doc: await getHashDocument(client, id)
+    }))
+  );
 
-  return {
-    bundle: {
-      ...payload,
-      signature_base64: signature.toString('base64'),
-      signed_payload_base64: payloadBytes.toString('base64')
+  const staleMutations: Array<{ id: string; doc: null }> = [];
+  const customRowsBySha256 = new Map<string, { sha256_hash: string; name: string }>();
+
+  for (const entry of docs) {
+    if (!isEligibleImmediateCustomHashOverlayDocument(entry.doc)) {
+      staleMutations.push({ id: entry.id, doc: null });
+      continue;
     }
-  };
+
+    const sha256 = normalizeHash(entry.doc?.sha256_hash, 64);
+    if (!sha256 || !entry.doc) {
+      staleMutations.push({ id: entry.id, doc: null });
+      continue;
+    }
+
+    if (fullSnapshotSha256.has(sha256)) {
+      continue;
+    }
+
+    if (!customRowsBySha256.has(sha256)) {
+      customRowsBySha256.set(sha256, {
+        sha256_hash: sha256,
+        name: String(entry.doc.name ?? `Custom SHA256 ${sha256.slice(0, 12)}`)
+      });
+    }
+  }
+
+  if (staleMutations.length > 0) {
+    overlayState = reconcileImmediateCustomHashOverlayState(staleMutations);
+  }
+
+  const rules: BundleRuleEntry[] = [];
+  const customRows = [...customRowsBySha256.values()].sort((left, right) => left.sha256_hash.localeCompare(right.sha256_hash));
+  if (customRows.length > 0) {
+    const dateVersion = todayDateVersion();
+    const fileBase = `custom-critical-hashes-${dateVersion}-00001`;
+    const content = hashYamlChunkContent(customRows);
+    rules.push({
+      id: fileBase,
+      filename: `${fileBase}.yaml`,
+      content,
+      sha256: crypto.createHash('sha256').update(content, 'utf8').digest('hex'),
+      enabled: true,
+      source: 'custom.overlay',
+      updatedAt: overlayState.generated_at
+    });
+  }
+
+  rules.sort((left, right) => left.id.localeCompare(right.id));
+  const activeChecksums = rules.map((rule) => rule.sha256).sort((left, right) => left.localeCompare(right));
+
+  return signHashBundlePayload({
+    manifest_version: 1 as const,
+    policy_id: policyId,
+    bundle_version: overlayState.bundle_version,
+    generated_at: overlayState.generated_at,
+    signing_alg: 'ed25519' as const,
+    rules,
+    active_checksums: activeChecksums
+  });
 }
 
 export function registerHashRoutes(router: any): void {
@@ -1062,10 +1240,24 @@ export function registerHashRoutes(router: any): void {
       path: '/api/xdr-defense/hashes/rules',
       validate: {
         body: schema.object({
-          name: schema.string({ minLength: 1, maxLength: 160 }),
-          content: schema.string({ minLength: 1, maxLength: 200000 }),
-          severity: schema.maybe(schema.string({ minLength: 1, maxLength: 32 })),
-          tags: schema.maybe(schema.arrayOf(schema.string({ minLength: 1, maxLength: 64 }), { maxSize: 32 }))
+          name: schema.maybe(schema.string({ maxLength: 160 })),
+          content: schema.maybe(schema.string({ maxLength: 200000 })),
+          enabled: schema.maybe(schema.boolean()),
+          severity: schema.maybe(schema.string({ maxLength: 32 })),
+          tags: schema.maybe(schema.arrayOf(schema.string({ minLength: 1, maxLength: 64 }), { maxSize: 32 })),
+          sha256_hash: schema.maybe(schema.string({ maxLength: 64 })),
+          md5_hash: schema.maybe(schema.string({ maxLength: 32 })),
+          sha1_hash: schema.maybe(schema.string({ maxLength: 40 })),
+          reporter: schema.maybe(schema.string({ maxLength: 256 })),
+          file_name: schema.maybe(schema.string({ maxLength: 512 })),
+          file_type_guess: schema.maybe(schema.string({ maxLength: 128 })),
+          mime_type: schema.maybe(schema.string({ maxLength: 256 })),
+          signature: schema.maybe(schema.string({ maxLength: 256 })),
+          clamav: schema.maybe(schema.string({ maxLength: 512 })),
+          vtpercent: schema.maybe(schema.string({ maxLength: 32 })),
+          imphash: schema.maybe(schema.string({ maxLength: 32 })),
+          ssdeep: schema.maybe(schema.string({ maxLength: 512 })),
+          tlsh: schema.maybe(schema.string({ maxLength: 128 }))
         })
       }
     },
@@ -1079,7 +1271,37 @@ export function registerHashRoutes(router: any): void {
           });
         }
 
-        const validation = validateHashContent(req.body?.content ?? '');
+        const fieldErrors: FieldErrorMap = {};
+        const sha256Hash = validateHexHashField(req.body?.sha256_hash, 64, 'sha256_hash', 'SHA256', fieldErrors);
+        const md5Hash = validateHexHashField(req.body?.md5_hash, 32, 'md5_hash', 'MD5', fieldErrors);
+        const sha1Hash = validateHexHashField(req.body?.sha1_hash, 40, 'sha1_hash', 'SHA1', fieldErrors);
+        const normalizedImphash = validateHexHashField(req.body?.imphash, 32, 'imphash', 'imphash', fieldErrors);
+        const explicitHashContent = buildCustomHashContent({
+          sha256_hash: sha256Hash,
+          md5_hash: md5Hash,
+          sha1_hash: sha1Hash
+        });
+
+        const rawContent = String(req.body?.content ?? '').trim();
+        const content = explicitHashContent || rawContent;
+        if (!content) {
+          const message = 'Provide at least one hash value (SHA256, MD5, or SHA1).';
+          addFieldError(fieldErrors, 'sha256_hash', message);
+          addFieldError(fieldErrors, 'md5_hash', message);
+          addFieldError(fieldErrors, 'sha1_hash', message);
+        }
+
+        if (hasFieldErrors(fieldErrors)) {
+          return res.customError({
+            statusCode: 400,
+            body: {
+              message: 'Hash rule request validation failed.',
+              field_errors: fieldErrors
+            }
+          });
+        }
+
+        const validation = validateHashContent(content);
         if (validation.status === 'invalid') {
           return res.customError({
             statusCode: 400,
@@ -1090,7 +1312,55 @@ export function registerHashRoutes(router: any): void {
           });
         }
 
-        const lines = String(req.body?.content ?? '').split(/\r?\n/);
+        const trimmedTags = Array.isArray(req.body?.tags)
+          ? req.body.tags.map((tag: unknown) => String(tag).trim()).filter((tag: string) => tag.length > 0)
+          : [];
+
+        if (explicitHashContent) {
+          const id = sha256Hash
+            ? sha256Hash
+            : md5Hash
+              ? `custom-md5-${md5Hash}`
+              : sha1Hash
+                ? `custom-sha1-${sha1Hash}`
+                : customDocId(content);
+
+          const fallbackName = cleanString(req.body?.signature)
+            ?? cleanString(req.body?.file_name)
+            ?? (sha256Hash ? `Custom SHA256 ${sha256Hash.slice(0, 12)}` : 'custom-hash');
+
+          const doc: HashIndexDocument = {
+            first_seen_utc: undefined,
+            sha256_hash: sha256Hash,
+            md5_hash: md5Hash,
+            sha1_hash: sha1Hash,
+            reporter: cleanString(req.body?.reporter),
+            file_name: cleanString(req.body?.file_name),
+            file_type_guess: cleanString(req.body?.file_type_guess),
+            mime_type: cleanString(req.body?.mime_type),
+            signature: cleanString(req.body?.signature),
+            clamav: cleanString(req.body?.clamav),
+            vtpercent: cleanString(req.body?.vtpercent),
+            imphash: normalizedImphash,
+            ssdeep: cleanString(req.body?.ssdeep),
+            tlsh: cleanString(req.body?.tlsh),
+            source: 'custom',
+            updated_at: nowIso(),
+            name: cleanString(req.body?.name) ?? fallbackName,
+            enabled: req.body?.enabled !== undefined ? Boolean(req.body.enabled) : true,
+            severity: normalizeStoredSeverity(req.body?.severity),
+            tags: trimmedTags,
+            content,
+            validation
+          };
+
+          const result = await upsertHashDocument(client, id, doc);
+          reconcileImmediateCustomHashOverlayState([{ id, doc, forceVersionBump: true }]);
+          return res.ok({ body: { imported: 1, result, id, validation } });
+        }
+
+        const overlayMutations: Array<{ id: string; doc: HashIndexDocument; forceVersionBump: true }> = [];
+        const lines = rawContent.split(/\r?\n/);
         let imported = 0;
         for (const line of lines) {
           const parsed = parseHashLine(line);
@@ -1111,28 +1381,33 @@ export function registerHashRoutes(router: any): void {
             sha256_hash: parsed.sha256,
             md5_hash: parsed.md5,
             sha1_hash: parsed.sha1,
-            reporter: undefined,
-            file_name: undefined,
-            file_type_guess: undefined,
-            mime_type: undefined,
-            signature: undefined,
-            clamav: undefined,
-            vtpercent: undefined,
-            imphash: undefined,
-            ssdeep: undefined,
-            tlsh: undefined,
+            reporter: cleanString(req.body?.reporter),
+            file_name: cleanString(req.body?.file_name),
+            file_type_guess: cleanString(req.body?.file_type_guess),
+            mime_type: cleanString(req.body?.mime_type),
+            signature: cleanString(req.body?.signature),
+            clamav: cleanString(req.body?.clamav),
+            vtpercent: cleanString(req.body?.vtpercent),
+            imphash: normalizedImphash,
+            ssdeep: cleanString(req.body?.ssdeep),
+            tlsh: cleanString(req.body?.tlsh),
             source: 'custom',
             updated_at: nowIso(),
-            name: String(req.body?.name ?? 'custom-hash'),
-            enabled: true,
-            severity: String(req.body?.severity ?? 'medium'),
-            tags: Array.isArray(req.body?.tags) ? req.body.tags.map((tag: unknown) => String(tag).trim()).filter((tag: string) => tag.length > 0) : [],
-            content: String(req.body?.content ?? ''),
+            name: cleanString(req.body?.name) ?? 'custom-hash',
+            enabled: req.body?.enabled !== undefined ? Boolean(req.body.enabled) : true,
+            severity: normalizeStoredSeverity(req.body?.severity),
+            tags: trimmedTags,
+            content: line.trim(),
             validation
           };
 
           await upsertHashDocument(client, id, doc);
+          overlayMutations.push({ id, doc, forceVersionBump: true });
           imported += 1;
+        }
+
+        if (imported > 0) {
+          reconcileImmediateCustomHashOverlayState(overlayMutations);
         }
 
         return res.ok({ body: { imported, validation } });
@@ -1181,7 +1456,7 @@ export function registerHashRoutes(router: any): void {
           ...existing,
           name: req.body?.name !== undefined ? String(req.body.name) : existing.name,
           content: nextContent,
-          severity: req.body?.severity !== undefined ? String(req.body.severity) : existing.severity,
+          severity: req.body?.severity !== undefined ? normalizeStoredSeverity(req.body.severity) : existing.severity,
           tags: req.body?.tags !== undefined
             ? req.body.tags.map((tag: unknown) => String(tag).trim()).filter((tag: string) => tag.length > 0)
             : existing.tags,
@@ -1191,6 +1466,11 @@ export function registerHashRoutes(router: any): void {
         };
 
         await upsertHashDocument(client, req.params.id, nextDoc);
+        if (existing.source === 'custom') {
+          reconcileImmediateCustomHashOverlayState([{ id: req.params.id, doc: nextDoc, forceVersionBump: true }]);
+        } else {
+          await prebuildDailyHashBundleSnapshotBestEffort(client, { forceRebuild: true });
+        }
         return res.ok({ body: { id: req.params.id, ...nextDoc, updatedAt: nextDoc.updated_at } });
       } catch (err: any) {
         return res.customError({
@@ -1218,9 +1498,16 @@ export function registerHashRoutes(router: any): void {
           return res.customError({ statusCode: 503, body: { message: 'OpenSearch scoped client unavailable.' } });
         }
 
+        const existing = await getHashDocument(client, req.params.id);
         const deleted = await deleteHashDocument(client, req.params.id);
         if (!deleted) {
           return res.customError({ statusCode: 404, body: { message: 'Rule not found.' } });
+        }
+
+        if (existing?.source === 'custom') {
+          reconcileImmediateCustomHashOverlayState([{ id: req.params.id, doc: null }]);
+        } else {
+          await prebuildDailyHashBundleSnapshotBestEffort(client, { forceRebuild: true });
         }
 
         return res.ok({ body: { deleted: true, id: req.params.id } });
@@ -1229,6 +1516,58 @@ export function registerHashRoutes(router: any): void {
           statusCode: 500,
           body: {
             message: 'Failed to delete hash rule.',
+            details: String(err?.message ?? err)
+          }
+        });
+      }
+    }
+  );
+
+  router.get(
+    {
+      path: '/api/xdr-defense/hashes/custom-overlay/bundle',
+      validate: {
+        query: schema.object({
+          policy_id: schema.maybe(schema.string({ minLength: 1, maxLength: 256 }))
+        })
+      }
+    },
+    async (ctx: any, req: any, res: any) => {
+      try {
+        const client = scopedOsClient(ctx);
+        if (!client) {
+          return res.customError({ statusCode: 503, body: { message: 'OpenSearch scoped client unavailable.' } });
+        }
+
+        const policyId = String(req.query?.policy_id ?? 'global-default');
+        const keyResult = getSigningPrivateKey();
+        if (!keyResult.ok) {
+          return res.customError({
+            statusCode: 503,
+            body: {
+              message: 'Signed custom hash overlay bundle generation unavailable.',
+              details: keyResult.error
+            }
+          });
+        }
+
+        const result = await buildSignedImmediateCustomHashOverlayBundle(client, policyId);
+        if (!result.bundle) {
+          return res.customError({
+            statusCode: 503,
+            body: {
+              message: 'Signed custom hash overlay bundle generation unavailable.',
+              details: result.error ?? 'Failed to sign bundle.'
+            }
+          });
+        }
+
+        return res.ok({ body: result.bundle });
+      } catch (err: any) {
+        return res.customError({
+          statusCode: 500,
+          body: {
+            message: 'Failed to build custom hash overlay bundle.',
             details: String(err?.message ?? err)
           }
         });
@@ -1264,7 +1603,10 @@ export function registerHashRoutes(router: any): void {
           });
         }
 
-        await prebuildDailyHashBundleSnapshotBestEffort(client, { forceRebuild: true });
+        // Use the cached daily snapshot built after each sync. The forceRebuild
+        // happens inside performMalwareBazaarSync / performMalwareBazaarDailyFullSync
+        // so agents always receive the most recently built bundle without triggering
+        // a full index scan on every poll.
         const result = await buildSignedHashBundle(client, policyId);
         if (!result.bundle) {
           return res.customError({
@@ -1334,6 +1676,160 @@ export function registerHashRoutes(router: any): void {
           statusCode: 500,
           body: {
             message: 'Failed to build hash bundle.',
+            details: String(err?.message ?? err)
+          }
+        });
+      }
+    }
+  );
+
+  router.post(
+    {
+      path: '/api/xdr-defense/hashes/rollouts/status/report',
+      validate: {
+        body: schema.object({
+          agent_id: schema.string({ minLength: 1, maxLength: 256 }),
+          policy_id: schema.maybe(schema.string({ minLength: 1, maxLength: 256 })),
+          state: schema.string({ minLength: 1, maxLength: 64 }),
+          full_bundle_version: schema.maybe(schema.number({ min: 0 })),
+          custom_bundle_version: schema.maybe(schema.number({ min: 0 })),
+          reported_at: schema.maybe(schema.oneOf([schema.number({ min: 0 }), schema.string({ minLength: 1, maxLength: 128 })])),
+          error: schema.maybe(schema.string({ minLength: 1, maxLength: 4096 })),
+          agent_hostname: schema.maybe(schema.string({ minLength: 1, maxLength: 256 }))
+        })
+      }
+    },
+    async (ctx: any, req: any, res: any) => {
+      try {
+        const client = scopedOsClient(ctx);
+        if (!client) {
+          return res.customError({ statusCode: 503, body: { message: 'OpenSearch scoped client unavailable.' } });
+        }
+
+        await ensureHashRolloutStatusIndex(client);
+        const result = await ingestHashRolloutStatusReport(client, req.body ?? {});
+        return res.ok({ body: result });
+      } catch (err: any) {
+        return res.customError({
+          statusCode: 500,
+          body: {
+            message: 'Failed to ingest hash rollout status report.',
+            details: String(err?.message ?? err)
+          }
+        });
+      }
+    }
+  );
+
+  router.get(
+    {
+      path: '/api/xdr-defense/hashes/rollouts/status',
+      validate: {
+        query: schema.object({
+          page: schema.maybe(schema.number({ min: 1, max: 100000 })),
+          pageSize: schema.maybe(schema.number({ min: 1, max: 500 }))
+        })
+      }
+    },
+    async (ctx: any, req: any, res: any) => {
+      try {
+        const client = scopedOsClient(ctx);
+        if (!client) {
+          return res.customError({ statusCode: 503, body: { message: 'OpenSearch scoped client unavailable.' } });
+        }
+
+        await ensureHashRolloutStatusIndex(client);
+        const result = await listHashRolloutStatus(client, {
+          page: req.query?.page,
+          pageSize: req.query?.pageSize
+        });
+        return res.ok({ body: result });
+      } catch (err: any) {
+        return res.customError({
+          statusCode: 500,
+          body: {
+            message: 'Failed to list hash rollout status.',
+            details: String(err?.message ?? err)
+          }
+        });
+      }
+    }
+  );
+
+  router.post(
+    {
+      path: '/api/xdr-defense/hashes/rollouts/retry',
+      validate: false
+    },
+    async (_ctx: any, _req: any, res: any) => {
+      try {
+        const state = bumpImmediateCustomHashOverlayBundleVersion();
+        return res.ok({
+          body: {
+            success: true,
+            message: 'Hash rollout retry accepted. Custom overlay bundle version bumped.',
+            overlay_bundle_version: state.bundle_version,
+            pending_custom_entries: state.pending_doc_ids.length,
+            generated_at: state.generated_at
+          }
+        });
+      } catch (err: any) {
+        return res.customError({
+          statusCode: 500,
+          body: {
+            message: 'Failed to retry hash rollout.',
+            details: String(err?.message ?? err)
+          }
+        });
+      }
+    }
+  );
+
+  router.post(
+    {
+      path: '/api/xdr-defense/hashes/rollout',
+      validate: {
+        body: schema.object({
+          policy_id: schema.maybe(schema.string({ minLength: 1, maxLength: 256 }))
+        })
+      }
+    },
+    async (ctx: any, req: any, res: any) => {
+      try {
+        const policyId = String(req.body?.policy_id ?? 'global-default');
+        const snapshot = dailyHashBundleSnapshot;
+
+        if (!snapshot) {
+          return res.customError({
+            statusCode: 409,
+            body: {
+              started: false,
+              success: false,
+              message: "No cached hash bundle available. Run 'Sync MalwareBazaar Daily' first.",
+              policy_id: policyId
+            }
+          });
+        }
+
+        return res.ok({
+          body: {
+            started: true,
+            success: true,
+            message: 'Cached hash rollout snapshot is ready. Agents will receive the cached hash bundle on next policy poll.',
+            policy_id: policyId,
+            dateVersion: snapshot.dateVersion,
+            bundle_version: snapshot.bundleVersion,
+            generated_at: snapshot.generatedAt,
+            rule_count: snapshot.rules.length,
+            total_critical_hashes: snapshot.totalCriticalHashes,
+            active_checksum_count: snapshot.activeChecksums.length
+          }
+        });
+      } catch (err: any) {
+        return res.customError({
+          statusCode: 500,
+          body: {
+            message: 'Failed to roll out hashes to agents.',
             details: String(err?.message ?? err)
           }
         });
@@ -1462,5 +1958,96 @@ export function registerHashRoutes(router: any): void {
       validate: false
     },
     syncApiHandler
+  );
+
+  // GET auto-update settings
+  router.get(
+    {
+      path: '/api/xdr-defense/hashes/malwarebazaar/auto-update-settings',
+      validate: false
+    },
+    async (_ctx: unknown, _req: unknown, res: any) => {
+      const settings = getMbAutoUpdateSettings();
+      return res.ok({
+        body: {
+          enabled: settings.enabled,
+          requests_per_day: settings.requests_per_day,
+          calls_per_window: callsPerWindow(settings.requests_per_day)
+        }
+      });
+    }
+  );
+
+  // POST auto-update settings
+  router.post(
+    {
+      path: '/api/xdr-defense/hashes/malwarebazaar/auto-update-settings',
+      validate: {
+        body: schema.object({
+          enabled: schema.boolean(),
+          requests_per_day: schema.number({ min: 1, max: 100000 })
+        })
+      }
+    },
+    async (_ctx: unknown, req: any, res: any) => {
+      try {
+        const saved = saveMbAutoUpdateSettings({
+          enabled: Boolean(req.body?.enabled),
+          requests_per_day: Math.round(Number(req.body?.requests_per_day) || 1000)
+        });
+        mbAutoUpdateScheduler.applySettings(saved);
+        return res.ok({
+          body: {
+            enabled: saved.enabled,
+            requests_per_day: saved.requests_per_day,
+            calls_per_window: callsPerWindow(saved.requests_per_day)
+          }
+        });
+      } catch (err: any) {
+        return res.customError({
+          statusCode: 400,
+          body: {
+            message: 'Failed to save auto-update settings.',
+            details: String(err?.message ?? err)
+          }
+        });
+      }
+    }
+  );
+
+  // POST one-shot auto-update test (always one upstream request when a candidate exists)
+  router.post(
+    {
+      path: '/api/xdr-defense/hashes/malwarebazaar/auto-update-sync-now',
+      validate: false
+    },
+    async (ctx: any, _req: any, res: any) => {
+      try {
+        const client = scopedOsClient(ctx);
+        if (!client) {
+          return res.customError({ statusCode: 503, body: { message: 'OpenSearch scoped client unavailable.' } });
+        }
+
+        const result = await mbAutoUpdateScheduler.runSingleRequestNow(client);
+        return res.ok({
+          body: {
+            attempted: result.attempted,
+            enriched: result.enriched,
+            message:
+              result.attempted === 0
+                ? 'No eligible hash documents were found for auto-update.'
+                : 'Manual auto-update sync completed.'
+          }
+        });
+      } catch (err: any) {
+        return res.customError({
+          statusCode: 400,
+          body: {
+            message: 'Failed to run MalwareBazaar auto-update sync now.',
+            details: String(err?.message ?? err)
+          }
+        });
+      }
+    }
   );
 }

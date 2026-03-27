@@ -2,6 +2,7 @@ import { registerArtifactRoutes } from './routes/artifacts';
 import { registerBehavioralRoutes } from './routes/behavioral';
 import { ensureHashesDataView } from './lib/hashes_data_view';
 import { ensureHashesIndex } from './lib/hashes_index';
+import { mbAutoUpdateScheduler } from './lib/mb_auto_update';
 import { registerHashRoutes } from './routes/hashes';
 import { registerPolicyRoutes } from './routes/policies';
 import { registerRollbackRoutes } from './routes/rollback';
@@ -19,6 +20,7 @@ export class XdrDefenseServerPlugin {
         // eslint-disable-next-line no-console
         console.error('xdr-defense: failed to initialize hashes index', err);
       });
+      mbAutoUpdateScheduler.init(bootstrapClient);
     }
 
     const router = core.http.createRouter();
@@ -45,5 +47,7 @@ export class XdrDefenseServerPlugin {
     return {};
   }
 
-  public stop() {}
+  public stop() {
+    mbAutoUpdateScheduler.destroy();
+  }
 }

@@ -13,12 +13,16 @@ export interface RuleValidation {
 
 export interface HashIndexDocument {
   first_seen_utc?: string;
+  last_seen_utc?: string;
   sha256_hash?: string;
+  sha3_384_hash?: string;
   md5_hash?: string;
   sha1_hash?: string;
   reporter?: string;
   file_name?: string;
   file_type_guess?: string;
+  file_format?: string;
+  file_arch?: string;
   mime_type?: string;
   signature?: string;
   clamav?: string;
@@ -26,6 +30,22 @@ export interface HashIndexDocument {
   imphash?: string;
   ssdeep?: string;
   tlsh?: string;
+  origin_country?: string;
+  anonymous?: boolean;
+  telfhash?: string;
+  gimphash?: string;
+  magika?: string;
+  dhash_icon?: string;
+  trid?: string;
+  comment?: string;
+  archive_pw?: string;
+  delivery_method?: string;
+  code_sign?: string;
+  intelligence_uploads?: number;
+  intelligence_downloads?: number;
+  intelligence_mail?: string;
+  intelligence_clamav?: string;
+  file_size?: number;
   source: 'malwarebazaar_api' | 'malwarebazaar_full_csv' | 'custom';
   updated_at: string;
   name: string;
@@ -200,12 +220,67 @@ function isAlreadyExistsError(err: unknown): boolean {
   return msg.includes('resource_already_exists_exception') || msg.includes('already exists');
 }
 
+function collectErrorNodes(errorNode: unknown, sink: Array<Record<string, unknown>>): void {
+  if (!errorNode || typeof errorNode !== 'object') {
+    return;
+  }
+
+  const node = errorNode as Record<string, unknown>;
+  sink.push(node);
+
+  if (Array.isArray(node.root_cause)) {
+    for (const entry of node.root_cause) {
+      collectErrorNodes(entry, sink);
+    }
+  }
+
+  collectErrorNodes(node.caused_by, sink);
+}
+
+function isIncompatibleMappingError(err: unknown): boolean {
+  const nodes: Array<Record<string, unknown>> = [];
+  collectErrorNodes((err as any)?.body?.error, nodes);
+  collectErrorNodes((err as any)?.meta?.body?.error, nodes);
+
+  for (const node of nodes) {
+    const type = String(node.type ?? '').toLowerCase();
+    const reason = String(node.reason ?? '').toLowerCase();
+    const mapperCannotChange = reason.includes('mapper [') && reason.includes('cannot be changed from type');
+    if ((type === 'illegal_argument_exception' || type === 'mapper_parsing_exception') && mapperCannotChange) {
+      return true;
+    }
+  }
+
+  const message = String((err as any)?.message ?? err ?? '').toLowerCase();
+  return message.includes('illegal_argument_exception') && message.includes('cannot be changed from type');
+}
+
+async function putHashesMappingForwardCompatible(client: any, mappings: Record<string, unknown>): Promise<void> {
+  try {
+    await client.indices.putMapping({
+      index: HASHES_INDEX_NAME,
+      body: mappings
+    });
+  } catch (err: any) {
+    if (!isIncompatibleMappingError(err)) {
+      throw err;
+    }
+
+    // eslint-disable-next-line no-console
+    console.warn(
+      'xdr-defense: incompatible hash index mapping detected; skipping putMapping update and continuing',
+      String(err?.message ?? err)
+    );
+  }
+}
+
 function hashesIndexDefinition() {
   return {
     mappings: {
       properties: {
         first_seen_utc: { type: 'date' },
         sha256_hash: { type: 'keyword' },
+        sha3_384_hash: { type: 'keyword' },
         md5_hash: { type: 'keyword' },
         sha1_hash: { type: 'keyword' },
         reporter: {
@@ -217,6 +292,8 @@ function hashesIndexDefinition() {
           fields: { keyword: { type: 'keyword', ignore_above: 512 } }
         },
         file_type_guess: { type: 'keyword' },
+        file_format: { type: 'keyword' },
+        file_arch: { type: 'keyword' },
         mime_type: { type: 'keyword' },
         signature: {
           type: 'text',
@@ -228,11 +305,43 @@ function hashesIndexDefinition() {
         },
         vtpercent: { type: 'keyword' },
         imphash: { type: 'keyword' },
+        telfhash: { type: 'keyword' },
+        gimphash: { type: 'keyword' },
+        magika: { type: 'keyword' },
+        dhash_icon: { type: 'keyword' },
+        trid: {
+          type: 'text',
+          fields: { keyword: { type: 'keyword', ignore_above: 512 } }
+        },
+        comment: {
+          type: 'text',
+          fields: { keyword: { type: 'keyword', ignore_above: 1024 } }
+        },
+        archive_pw: { type: 'keyword' },
+        delivery_method: { type: 'keyword' },
+        code_sign: {
+          type: 'text',
+          fields: { keyword: { type: 'keyword', ignore_above: 2048 } }
+        },
+        origin_country: { type: 'keyword' },
+        anonymous: { type: 'boolean' },
+        intelligence_uploads: { type: 'long' },
+        intelligence_downloads: { type: 'long' },
+        intelligence_mail: {
+          type: 'text',
+          fields: { keyword: { type: 'keyword', ignore_above: 512 } }
+        },
+        intelligence_clamav: {
+          type: 'text',
+          fields: { keyword: { type: 'keyword', ignore_above: 512 } }
+        },
         ssdeep: {
           type: 'text',
           fields: { keyword: { type: 'keyword', ignore_above: 512 } }
         },
         tlsh: { type: 'keyword' },
+        last_seen_utc: { type: 'date' },
+        file_size: { type: 'long' },
         source: { type: 'keyword' },
         updated_at: { type: 'date' },
         name: {
@@ -272,8 +381,11 @@ export async function ensureHashesIndex(client: any): Promise<void> {
 
   if (!hashesIndexEnsureInFlight) {
     hashesIndexEnsureInFlight = (async () => {
+      const definition = hashesIndexDefinition();
       const existsResponse = await client.indices.exists({ index: HASHES_INDEX_NAME });
       if (indexExistsResponseToBoolean(existsResponse)) {
+        // Keep mappings forward-compatible when new enrichment fields are introduced.
+        await putHashesMappingForwardCompatible(client, definition.mappings);
         hashesIndexReady = true;
         return;
       }
@@ -281,12 +393,14 @@ export async function ensureHashesIndex(client: any): Promise<void> {
       try {
         await client.indices.create({
           index: HASHES_INDEX_NAME,
-          body: hashesIndexDefinition()
+          body: definition
         });
       } catch (err: any) {
         if (!isAlreadyExistsError(err)) {
           throw err;
         }
+
+        await putHashesMappingForwardCompatible(client, definition.mappings);
       }
 
       hashesIndexReady = true;

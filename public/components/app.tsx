@@ -5,9 +5,7 @@ import {
   EuiButtonIcon,
   EuiButtonEmpty,
   EuiCallOut,
-  EuiCheckbox,
   EuiCodeBlock,
-  EuiFieldSearch,
   EuiFieldNumber,
   EuiFieldText,
   EuiFlexGroup,
@@ -102,42 +100,44 @@ interface BundleMetadata {
   enabled_rule_count: number;
 }
 
-interface RuleRolloutSummary {
-  pending: number;
-  acknowledged: number;
-  failed: number;
-  last_action?: 'activate' | 'deactivate' | 'delete';
-  last_dispatched_at?: string;
-}
-
-interface RolloutFailureRecord {
-  command_id: string;
-  dispatch_version: string;
-  agent_id: string;
-  agent_hostname?: string;
-  rule_id: string;
-  rule_name: string;
-  action: 'activate' | 'deactivate' | 'delete';
-  status: 'pending' | 'acknowledged' | 'failed';
-  attempts: number;
-  last_dispatched_at: string;
-  acknowledged_at?: string;
-  failure_reason?: string;
-  retryable: boolean;
-}
-
-interface RolloutStatusResponse {
-  summary: {
-    total_commands: number;
-    pending: number;
-    acknowledged: number;
+interface YaraRolloutResponse {
+  started?: boolean;
+  success?: boolean;
+  message?: string;
+  policy_id?: string;
+  bundle_version?: number;
+  generated_at?: string;
+  rule_count?: number;
+  confirmation?: {
+    target_agents: number;
+    confirmed_agents: number;
+    applied: number;
+    partial: number;
     failed: number;
-    retryable: number;
-    stale_timeout_minutes: number;
-    generated_at: string;
+    pending: number;
+    timed_out: boolean;
   };
-  failures: RolloutFailureRecord[];
-  rules: Record<string, RuleRolloutSummary>;
+}
+
+interface YaraRolloutStatusRow {
+  agent: string;
+  policy: string;
+  state: string;
+  bundle_version?: number;
+  total_rules?: number;
+  loaded_rules?: number;
+  failed_rule_count?: number;
+  last_reported?: string;
+  error?: string;
+}
+
+interface YaraRolloutStatusPageResponse {
+  page: number;
+  pageSize: number;
+  total: number;
+  totalPages: number;
+  stale_after_minutes: number;
+  items: YaraRolloutStatusRow[];
 }
 
 interface ForgeCoreSyncMetadata {
@@ -291,17 +291,22 @@ export const XdrDefenseApp: React.FC<XdrDefenseAppProps> = ({ http, notification
   // ---- Rule data ----
   const [yaraRules, setYaraRules] = useState<ManagedRule[]>([]);
   const [hashRules, setHashRules] = useState<ManagedRule[]>([]);
+  const [yaraRolloutRows, setYaraRolloutRows] = useState<YaraRolloutStatusRow[]>([]);
+  const [yaraRolloutTotal, setYaraRolloutTotal] = useState(0);
+  const [yaraRolloutTotalPages, setYaraRolloutTotalPages] = useState(1);
+  const [yaraRolloutStaleAfterMinutes, setYaraRolloutStaleAfterMinutes] = useState(30);
   const [hashRolloutRows, setHashRolloutRows] = useState<HashRolloutStatusRow[]>([]);
   const [hashRolloutTotal, setHashRolloutTotal] = useState(0);
   const [hashRolloutTotalPages, setHashRolloutTotalPages] = useState(1);
   const [hashRolloutStaleAfterMinutes, setHashRolloutStaleAfterMinutes] = useState(30);
   const [behavioralRules, setBehavioralRules] = useState<ManagedRule[]>([]);
   const [bundleMetadata, setBundleMetadata] = useState<BundleMetadata | null>(null);
-  const [rolloutStatus, setRolloutStatus] = useState<RolloutStatusResponse | null>(null);
   const [yaraForgeSyncStatus, setYaraForgeSyncStatus] = useState<ForgeCoreSyncMetadata | null>(null);
   const [isSyncingYaraForge, setIsSyncingYaraForge] = useState(false);
   const [malwareBazaarStatus, setMalwareBazaarStatus] = useState<MalwareBazaarStatus | null>(null);
   const [isSyncingMalwareBazaar, setIsSyncingMalwareBazaar] = useState(false);
+  const [isRollingOutYara, setIsRollingOutYara] = useState(false);
+  const [isRetryingYaraRollout, setIsRetryingYaraRollout] = useState(false);
   const [isRollingOutHashes, setIsRollingOutHashes] = useState(false);
   const [isRetryingHashRollout, setIsRetryingHashRollout] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
@@ -310,12 +315,9 @@ export const XdrDefenseApp: React.FC<XdrDefenseAppProps> = ({ http, notification
   const [drawerOpen, setDrawerOpen] = useState<'none' | 'yara' | 'hashes' | 'behavioral' | 'malwarebazaar-config'>('none');
   const [banner, setBanner] = useState<{ kind: 'success' | 'error' | 'warning'; message: string } | null>(null);
 
-  // ---- YARA pagination / search / selection ----
-  const [yaraSearchQuery, setYaraSearchQuery] = useState('');
-  const [yaraPageSize, setYaraPageSize] = useState(20);
-  const [yaraPageIndex, setYaraPageIndex] = useState(0);
-  const [selectedYaraIds, setSelectedYaraIds] = useState<Set<string>>(new Set());
-  const [isYaraBusy, setIsYaraBusy] = useState(false);
+  // ---- YARA rollout pagination ----
+  const [yaraRolloutPageSize, setYaraRolloutPageSize] = useState(20);
+  const [yaraRolloutPageIndex, setYaraRolloutPageIndex] = useState(0);
 
   // ---- Hashes pagination / search / selection ----
   const [hashRolloutPageSize, setHashRolloutPageSize] = useState(20);
@@ -486,14 +488,24 @@ export const XdrDefenseApp: React.FC<XdrDefenseAppProps> = ({ http, notification
     }
   }, [http]);
 
-  const refreshRolloutStatus = useCallback(async () => {
+  const refreshYaraRolloutStatus = useCallback(async (input?: { pageIndex?: number; pageSize?: number }) => {
     try {
-      const payload = (await http.get('/api/xdr-defense/yara/rollouts/status')) as RolloutStatusResponse;
-      setRolloutStatus(payload);
+      const pageIndex = input?.pageIndex ?? yaraRolloutPageIndex;
+      const pageSize = input?.pageSize ?? yaraRolloutPageSize;
+      const params = new URLSearchParams();
+      params.set('page', String(pageIndex + 1));
+      params.set('pageSize', String(pageSize));
+      const payload = (await http.get(`/api/xdr-defense/yara/rollouts/status?${params.toString()}`)) as YaraRolloutStatusPageResponse;
+      setYaraRolloutRows(Array.isArray(payload?.items) ? payload.items : []);
+      setYaraRolloutTotal(Number(payload?.total ?? 0));
+      setYaraRolloutTotalPages(Math.max(1, Number(payload?.totalPages ?? 1)));
+      setYaraRolloutStaleAfterMinutes(Number(payload?.stale_after_minutes ?? 30));
     } catch {
-      setRolloutStatus(null);
+      setYaraRolloutRows([]);
+      setYaraRolloutTotal(0);
+      setYaraRolloutTotalPages(1);
     }
-  }, [http]);
+  }, [http, yaraRolloutPageIndex, yaraRolloutPageSize]);
 
   const refreshYaraForgeSyncStatus = useCallback(async () => {
     try {
@@ -539,12 +551,12 @@ export const XdrDefenseApp: React.FC<XdrDefenseAppProps> = ({ http, notification
       refreshHashRules(),
       refreshBehavioralRules(),
       refreshBundleMetadata(),
-      refreshRolloutStatus(),
+      refreshYaraRolloutStatus(),
       refreshYaraForgeSyncStatus(),
       refreshMalwareBazaarStatus(),
       refreshHashRolloutStatus(),
     ]);
-  }, [refreshYaraRules, refreshHashRules, refreshBehavioralRules, refreshBundleMetadata, refreshRolloutStatus, refreshYaraForgeSyncStatus, refreshMalwareBazaarStatus, refreshHashRolloutStatus]);
+  }, [refreshYaraRules, refreshHashRules, refreshBehavioralRules, refreshBundleMetadata, refreshYaraRolloutStatus, refreshYaraForgeSyncStatus, refreshMalwareBazaarStatus, refreshHashRolloutStatus]);
 
   useEffect(() => {
     setIsLoading(true);
@@ -580,129 +592,70 @@ export const XdrDefenseApp: React.FC<XdrDefenseAppProps> = ({ http, notification
   }, [isSyncingMalwareBazaar, malwareBazaarStatus?.status, refreshMalwareBazaarStatus]);
 
   useEffect(() => {
+    refreshYaraRolloutStatus();
+  }, [yaraRolloutPageIndex, yaraRolloutPageSize, refreshYaraRolloutStatus]);
+
+  useEffect(() => {
     refreshHashRolloutStatus();
   }, [hashRolloutPageIndex, hashRolloutPageSize, refreshHashRolloutStatus]);
 
   // ---------------------------------------------------------------------------
-  // YARA tab — filtered + paged rows (computed before columns for select-all)
+  // Rollout status columns
   // ---------------------------------------------------------------------------
 
-  const filteredYaraRules = yaraRules
-    .filter((rule) => {
-      const q = yaraSearchQuery.toLowerCase();
-      return !q || rule.name.toLowerCase().includes(q) || rule.tags.some((t) => t.toLowerCase().includes(q));
-    })
-    .sort((a, b) => a.name.localeCompare(b.name));
-
-  const yaraTotal = filteredYaraRules.length;
-  const yaraTotalPages = Math.max(1, Math.ceil(yaraTotal / yaraPageSize));
-  const yaraCurrentPage = Math.min(yaraPageIndex, yaraTotalPages - 1);
-  const pagedYaraRules = filteredYaraRules.slice(yaraCurrentPage * yaraPageSize, (yaraCurrentPage + 1) * yaraPageSize);
-
-  const allPageSelected = pagedYaraRules.length > 0 && pagedYaraRules.every((r) => selectedYaraIds.has(r.id));
-  const somePageSelected = pagedYaraRules.some((r) => selectedYaraIds.has(r.id));
-
-  // ---------------------------------------------------------------------------
-  // YARA tab columns
-  // ---------------------------------------------------------------------------
-
-  const yaraColumns = [
+  const yaraRolloutColumns = [
+    { field: 'agent', name: 'Agent' },
+    { field: 'policy', name: 'Policy' },
     {
-      name: (
-        <EuiCheckbox
-          id="yara-select-all"
-          label=""
-          checked={allPageSelected}
-          indeterminate={somePageSelected && !allPageSelected}
-          onChange={() => {
-            if (allPageSelected) {
-              setSelectedYaraIds((prev) => {
-                const next = new Set(prev);
-                pagedYaraRules.forEach((r) => next.delete(r.id));
-                return next;
-              });
-            } else {
-              setSelectedYaraIds((prev) => {
-                const next = new Set(prev);
-                pagedYaraRules.forEach((r) => next.add(r.id));
-                return next;
-              });
-            }
-          }}
-        />
-      ),
-      width: '40px',
-      render: (rule: ManagedRule) => (
-        <EuiCheckbox
-          id={`yara-sel-${rule.id}`}
-          label=""
-          checked={selectedYaraIds.has(rule.id)}
-          onChange={() => {
-            setSelectedYaraIds((prev) => {
-              const next = new Set(prev);
-              if (next.has(rule.id)) next.delete(rule.id);
-              else next.add(rule.id);
-              return next;
-            });
-          }}
-        />
-      ),
-    },
-    { field: 'name', name: 'Name' },
-    { field: 'source', name: 'Source' },
-    { field: 'severity', name: 'Severity' },
-    {
-      field: 'tags',
-      name: 'Tags',
-      render: (tags: string[]) => tags.join(', '),
-    },
-    {
-      field: 'validation',
-      name: 'Validation',
-      render: (v: RuleValidation) => (
-        <>
-          <EuiBadge color={v.status === 'valid' ? 'success' : 'danger'}>{v.status}</EuiBadge>
-          {v.errors.length > 0 && (
-            <EuiText size="xs" color="danger">
-              <p>{v.errors.join('; ')}</p>
-            </EuiText>
-          )}
-        </>
-      ),
-    },
-    {
+      field: 'state',
       name: 'State',
-      render: (rule: ManagedRule) => (
-        <EuiSwitch
-          label="enabled"
-          checked={rule.enabled}
-          disabled={rule.validation.status === 'invalid'}
-          compressed
-          onChange={async (e) => {
-            try {
-              await http.put(`/api/xdr-defense/yara/rules/${encodeURIComponent(rule.id)}`, {
-                body: JSON.stringify({ enabled: (e.target as HTMLInputElement).checked }),
-              });
-              await refreshAll();
-              setBanner({ kind: 'success', message: 'YARA rule state updated and rollout command queued.' });
-            } catch (err: unknown) {
-              setBanner({ kind: 'error', message: `Failed to update YARA rule: ${String((err as Error)?.message ?? err)}` });
-              await refreshAll();
-            }
-          }}
-        />
+      render: (state: string) => (
+        <EuiBadge
+          color={
+            state === 'applied'
+              ? 'success'
+              : state === 'partial'
+                ? 'warning'
+                : state === 'failed'
+                  ? 'danger'
+                  : 'hollow'
+          }
+        >
+          {state}
+        </EuiBadge>
       ),
     },
     {
-      field: 'updatedAt',
-      name: 'Updated',
-      render: (date: string) => new Date(date).toLocaleString(),
+      field: 'bundle_version',
+      name: 'Bundle Version',
+      render: (value?: number) => (value !== undefined ? String(value) : '-'),
+    },
+    {
+      field: 'loaded_rules',
+      name: 'Loaded Rules',
+      render: (_: number | undefined, row: YaraRolloutStatusRow) => {
+        if (row.loaded_rules === undefined && row.total_rules === undefined) {
+          return '-';
+        }
+        return `${row.loaded_rules ?? 0}/${row.total_rules ?? 0}`;
+      },
+    },
+    {
+      field: 'failed_rule_count',
+      name: 'Failed Rules',
+      render: (value?: number) => String(value ?? 0),
+    },
+    {
+      field: 'last_reported',
+      name: 'Last Reported',
+      render: (value?: string) => (value ? new Date(value).toLocaleString() : '-'),
+    },
+    {
+      field: 'error',
+      name: 'Error',
+      render: (value?: string) => value || '-',
     },
   ];
-
-  // ---------------------------------------------------------------------------
-  // Hashes tab columns
-  // ---------------------------------------------------------------------------
 
   const hashRolloutColumns = [
     { field: 'agent', name: 'Agent' },
@@ -815,26 +768,6 @@ export const XdrDefenseApp: React.FC<XdrDefenseAppProps> = ({ http, notification
   ];
 
   // ---------------------------------------------------------------------------
-  // Rollout failure monitor columns
-  // ---------------------------------------------------------------------------
-
-  const rolloutFailureColumns = [
-    { field: 'agent_hostname', name: 'Agent', render: (_: string | undefined, row: RolloutFailureRecord) => row.agent_hostname || row.agent_id },
-    { field: 'rule_name', name: 'Rule' },
-    { field: 'action', name: 'Action' },
-    {
-      field: 'status',
-      name: 'Status',
-      render: (s: string) => (
-        <EuiBadge color={s === 'acknowledged' ? 'success' : s === 'failed' ? 'danger' : 'warning'}>{s}</EuiBadge>
-      ),
-    },
-    { field: 'attempts', name: 'Attempts' },
-    { field: 'last_dispatched_at', name: 'Last Dispatch', render: (d: string) => new Date(d).toLocaleString() },
-    { field: 'failure_reason', name: 'Reason', render: (r: string | undefined) => r || 'No ACK yet' },
-  ];
-
-  // ---------------------------------------------------------------------------
   // Severity select options (shared)
   // ---------------------------------------------------------------------------
 
@@ -881,37 +814,176 @@ export const XdrDefenseApp: React.FC<XdrDefenseAppProps> = ({ http, notification
     : 'Sync YARA Forge Core';
 
   const renderYaraTab = () => {
-    const rollout = rolloutStatus?.summary;
     const activeCount = yaraRules.filter((r) => r.enabled).length;
     const invalidCount = yaraRules.filter((r) => r.validation.status === 'invalid').length;
-    const failures = rolloutStatus?.failures ?? [];
     const syncMeta = yaraForgeSyncStatus;
-    const selectedList = [...selectedYaraIds];
-    const hasSelection = selectedList.length > 0;
-    const selectedRules = yaraRules.filter((r) => selectedYaraIds.has(r.id));
-    const selectedDeletable = selectedRules.filter((r) => r.source !== 'builtin');
+    const rolloutCurrentPage = Math.min(yaraRolloutPageIndex, Math.max(0, yaraRolloutTotalPages - 1));
 
     return (
       <>
-        {/* Top panel */}
         <EuiPanel>
           <EuiFlexGroup justifyContent="spaceBetween" alignItems="flexStart" wrap>
             <EuiFlexItem grow={false}>
-              <EuiTitle size="s"><h3>Detection Content Registry</h3></EuiTitle>
+              <EuiTitle size="s"><h3>YARA Content Registry</h3></EuiTitle>
               <EuiSpacer size="xs" />
-              <EuiText size="s" color="subdued"><p>Manage YARA rules with search, pagination, and automatic agent rollout.</p></EuiText>
+              <EuiText size="s" color="subdued">
+                <p>Sync YARA Forge Core into the persisted registry, build the signed cached bundle, and roll it out to agents on demand.</p>
+              </EuiText>
               <EuiSpacer size="s" />
-              <EuiFlexGroup gutterSize="s" wrap>
-                <EuiFlexItem grow={false}><EuiBadge color="hollow">total {yaraRules.length}</EuiBadge></EuiFlexItem>
-                <EuiFlexItem grow={false}><EuiBadge color="default">active {activeCount}</EuiBadge></EuiFlexItem>
-                <EuiFlexItem grow={false}><EuiBadge color="danger">invalid {invalidCount}</EuiBadge></EuiFlexItem>
+              <EuiFlexGroup gutterSize="s" alignItems="center" wrap>
+                <EuiFlexItem grow={false}><EuiBadge color="hollow">stored {yaraRules.length}</EuiBadge></EuiFlexItem>
+                <EuiFlexItem grow={false}><EuiBadge color="default">enabled {activeCount}</EuiBadge></EuiFlexItem>
+                <EuiFlexItem grow={false}><EuiBadge color={invalidCount > 0 ? 'danger' : 'success'}>invalid {invalidCount}</EuiBadge></EuiFlexItem>
+                <EuiFlexItem grow={false}><EuiBadge color={syncBadgeColor}>sync {syncMeta?.status ?? 'idle'}</EuiBadge></EuiFlexItem>
+                {bundleMetadata && (
+                  <EuiFlexItem grow={false}><EuiBadge color="accent">bundle {bundleMetadata.bundle_version}</EuiBadge></EuiFlexItem>
+                )}
+              </EuiFlexGroup>
+              <EuiSpacer size="xs" />
+              <EuiText size="xs" color="subdued">
+                <p>
+                  {syncMeta?.started_at
+                    ? `last sync started ${new Date(syncMeta.started_at).toLocaleString()}`
+                    : 'No YARA Forge Core sync started yet.'}
+                  {syncMeta?.completed_at ? ` · completed ${new Date(syncMeta.completed_at).toLocaleString()}` : ''}
+                  {bundleMetadata?.generated_at ? ` · bundle generated ${new Date(bundleMetadata.generated_at).toLocaleString()}` : ''}
+                </p>
+              </EuiText>
+            </EuiFlexItem>
+            <EuiFlexItem grow={false}>
+              <EuiFlexGroup gutterSize="s" alignItems="center" wrap>
+                <EuiFlexItem grow={false}>
+                  <EuiButton
+                    fill
+                    isDisabled={isSyncing}
+                    isLoading={isSyncing}
+                    onClick={async () => {
+                      if (isSyncing) return;
+                      setBanner(null);
+                      setIsSyncingYaraForge(true);
+                      try {
+                        const result = (await http.post('/api/xdr-defense/yara/forge-core/sync', {
+                          body: JSON.stringify({}),
+                        })) as {
+                          status: 'completed' | 'running';
+                          attempted: number;
+                          loaded: number;
+                          imported: number;
+                          unchanged: number;
+                          removed?: number;
+                          load_failures: number;
+                          metadata?: ForgeCoreSyncMetadata;
+                          errors?: string[];
+                        };
+                        if (result.metadata) {
+                          setYaraForgeSyncStatus(result.metadata);
+                        }
+                        await refreshAll();
+                        const errorText = Array.isArray(result.errors) && result.errors.length > 0
+                          ? ` Issues: ${result.errors.join(' | ')}`
+                          : '';
+                        notifications.toasts.addSuccess(
+                          `YARA Forge Core sync ${result.status === 'running' ? 'already running' : 'completed'}.`
+                        );
+                        setBanner({
+                          kind: 'success',
+                          message: `YARA Forge Core sync ${result.status === 'running' ? 'already running' : 'completed'}. Attempted ${result.attempted}, loaded ${result.loaded}, imported ${result.imported}, unchanged ${result.unchanged}, removed ${result.removed ?? 0}, load failures ${result.load_failures}.${errorText}`,
+                        });
+                      } catch (err: unknown) {
+                        notifications.toasts.addDanger({ title: 'Unable to sync YARA Forge Core', text: (err as Error)?.message });
+                        setBanner({ kind: 'error', message: `Failed to sync YARA Forge Core: ${String((err as Error)?.message ?? err)}` });
+                      } finally {
+                        await refreshYaraForgeSyncStatus();
+                        await refreshBundleMetadata();
+                        await refreshYaraRolloutStatus();
+                        setIsSyncingYaraForge(false);
+                      }
+                    }}
+                  >
+                    {syncButtonLabel}
+                  </EuiButton>
+                </EuiFlexItem>
+                <EuiFlexItem grow={false}>
+                  <EuiButton onClick={() => setDrawerOpen('yara')}>Add Custom Content</EuiButton>
+                </EuiFlexItem>
+                <EuiFlexItem grow={false}>
+                  <EuiButton
+                    isLoading={isRollingOutYara}
+                    isDisabled={isRollingOutYara}
+                    onClick={async () => {
+                      if (isRollingOutYara) return;
+                      setIsRollingOutYara(true);
+                      setBanner(null);
+                      try {
+                        const result = (await http.post('/api/xdr-defense/yara/rollout', {
+                          body: JSON.stringify({ policy_id: 'global-default' }),
+                        })) as YaraRolloutResponse;
+                        await refreshBundleMetadata();
+                        await refreshYaraForgeSyncStatus();
+                        await refreshYaraRolloutStatus();
+                        const bundleVersion = result.bundle_version ?? 'n/a';
+                        const ruleCount = result.rule_count ?? 0;
+                        const confirmation = result.confirmation;
+                        const confirmationText = confirmation
+                          ? ` Confirmed ${confirmation.confirmed_agents}/${confirmation.target_agents}, applied ${confirmation.applied}, partial ${confirmation.partial}, failed ${confirmation.failed}, pending ${confirmation.pending}.`
+                          : '';
+                        notifications.toasts.addSuccess(`YARA rollout triggered. Bundle version ${bundleVersion}, rules ${ruleCount}.`);
+                        setBanner({
+                          kind: confirmation?.timed_out ? 'error' : 'success',
+                          message: result.message
+                            ? `${result.message} Bundle version ${bundleVersion}, rules ${ruleCount}.${confirmationText}`
+                            : `YARA rollout triggered. Bundle version ${bundleVersion}, rules ${ruleCount}.${confirmationText}`,
+                        });
+                      } catch (err: unknown) {
+                        notifications.toasts.addDanger({ title: 'Unable to roll out YARA to all agents', text: (err as Error)?.message });
+                        setBanner({ kind: 'error', message: `Failed to roll out YARA to all agents: ${String((err as Error)?.message ?? err)}` });
+                      } finally {
+                        setIsRollingOutYara(false);
+                      }
+                    }}
+                  >
+                    Rollout YARA to All Agents
+                  </EuiButton>
+                </EuiFlexItem>
+                <EuiFlexItem grow={false}>
+                  <EuiButton
+                    isLoading={isRetryingYaraRollout}
+                    isDisabled={isRetryingYaraRollout}
+                    onClick={async () => {
+                      if (isRetryingYaraRollout) return;
+                      setIsRetryingYaraRollout(true);
+                      setBanner(null);
+                      try {
+                        const result = (await http.post('/api/xdr-defense/yara/rollouts/retry', {
+                          body: JSON.stringify({}),
+                        })) as YaraRolloutResponse;
+                        await refreshYaraRolloutStatus();
+                        const confirmation = result.confirmation;
+                        const confirmationText = confirmation
+                          ? ` Confirmed ${confirmation.confirmed_agents}/${confirmation.target_agents}, applied ${confirmation.applied}, partial ${confirmation.partial}, failed ${confirmation.failed}, pending ${confirmation.pending}.`
+                          : '';
+                        notifications.toasts.addSuccess('YARA rollout retry requested.');
+                        setBanner({
+                          kind: confirmation?.timed_out ? 'error' : 'success',
+                          message: `${result.message ?? 'YARA rollout retry requested.'}${confirmationText}`,
+                        });
+                      } catch (err: unknown) {
+                        notifications.toasts.addDanger({ title: 'Unable to retry YARA rollout', text: (err as Error)?.message });
+                        setBanner({ kind: 'error', message: `Failed to retry YARA rollout: ${String((err as Error)?.message ?? err)}` });
+                      } finally {
+                        setIsRetryingYaraRollout(false);
+                      }
+                    }}
+                  >
+                    Retry YARA Rollout
+                  </EuiButton>
+                </EuiFlexItem>
               </EuiFlexGroup>
             </EuiFlexItem>
           </EuiFlexGroup>
 
           <EuiSpacer size="m" />
 
-          {/* Sync status sub-panel */}
           <EuiPanel color="subdued" paddingSize="s">
             <EuiFlexGroup justifyContent="spaceBetween" alignItems="center" wrap>
               <EuiFlexItem grow={false}>
@@ -936,6 +1008,8 @@ export const XdrDefenseApp: React.FC<XdrDefenseAppProps> = ({ http, notification
                   size="xs"
                   onClick={async () => {
                     await refreshYaraForgeSyncStatus();
+                    await refreshBundleMetadata();
+                    await refreshYaraRolloutStatus();
                   }}
                 >
                   Refresh Sync Status
@@ -949,11 +1023,12 @@ export const XdrDefenseApp: React.FC<XdrDefenseAppProps> = ({ http, notification
                 `loaded ${syncMeta?.loaded ?? 0}`,
                 `imported ${syncMeta?.imported ?? 0}`,
                 `unchanged ${syncMeta?.unchanged ?? 0}`,
+                `removed ${syncMeta?.removed ?? 0}`,
                 `load failures ${syncMeta?.load_failures ?? 0}`,
-                `rollout planned ${syncMeta?.rollout?.planned_rules ?? 0}`,
-                `rollout processed ${syncMeta?.rollout?.processed_rules ?? 0}`,
                 `rollout created ${syncMeta?.rollout?.created ?? 0}`,
                 `rollout deduplicated ${syncMeta?.rollout?.deduplicated ?? 0}`,
+                `signed rules ${bundleMetadata?.rule_count ?? yaraRules.length}`,
+                `enabled rules ${bundleMetadata?.enabled_rule_count ?? activeCount}`,
               ].map((label) => (
                 <EuiFlexItem key={label} grow={false}>
                   <EuiText size="xs" color="subdued"><p>{label}</p></EuiText>
@@ -968,242 +1043,41 @@ export const XdrDefenseApp: React.FC<XdrDefenseAppProps> = ({ http, notification
 
         <EuiSpacer size="m" />
 
-        {/* Rollout failure monitor — above rules table */}
         <EuiPanel>
-          <EuiFlexGroup justifyContent="spaceBetween" alignItems="center" wrap>
-            <EuiFlexItem grow={false}>
-              <EuiTitle size="s"><h3>YARA Rollout Failure Monitor</h3></EuiTitle>
-            </EuiFlexItem>
-            <EuiFlexItem grow={false}>
-              <EuiFlexGroup gutterSize="s" alignItems="center" wrap>
-                <EuiFlexItem grow={false}>
-                  <EuiButton
-                    size="s"
-                    onClick={async () => {
-                      setBanner(null);
-                      try {
-                        const result = (await http.post('/api/xdr-defense/yara/rollouts/retry', {
-                          body: JSON.stringify({}),
-                        })) as { retried: number };
-                        await refreshRolloutStatus();
-                        setBanner({ kind: 'success', message: `Retried ${result.retried} rollout command(s).` });
-                      } catch (err: unknown) {
-                        setBanner({ kind: 'error', message: `Failed to retry rollout failures: ${String((err as Error)?.message ?? err)}` });
-                      }
-                    }}
-                  >
-                    Retry Pending Failures
-                  </EuiButton>
-                </EuiFlexItem>
-                <EuiFlexItem grow={false}>
-                  <EuiText size="s" color="subdued">
-                    <p>pending {rollout?.pending ?? 0} | acked {rollout?.acknowledged ?? 0} | failed {rollout?.failed ?? 0} | retryable {rollout?.retryable ?? 0}</p>
-                  </EuiText>
-                </EuiFlexItem>
-              </EuiFlexGroup>
-            </EuiFlexItem>
-          </EuiFlexGroup>
-
+          <EuiTitle size="s"><h3>YARA Rollout Status</h3></EuiTitle>
           <EuiSpacer size="s" />
 
-          {failures.length === 0 ? (
-            <EuiText size="s" color="subdued">
-              <p>No rollout failures detected. Commands are either acknowledged or still within ACK timeout.</p>
-            </EuiText>
-          ) : (
-            <div style={{ overflowX: 'auto' }}>
-              <EuiInMemoryTable
-                itemId="command_id"
-                items={failures}
-                columns={rolloutFailureColumns as any}
-                pagination={false}
-                sorting={false}
-              />
-            </div>
-          )}
-        </EuiPanel>
-
-        <EuiSpacer size="m" />
-
-        {/* Yara rules table */}
-        <EuiPanel>
-          {/* Title + toolbar: Sync+Add left / Enable+Disable+Delete right */}
-          <EuiTitle size="s"><h3>Yara rules</h3></EuiTitle>
-          <EuiSpacer size="s" />
           <EuiFlexGroup alignItems="center" justifyContent="spaceBetween" gutterSize="s" wrap>
             <EuiFlexItem grow={false}>
-              <EuiFlexGroup alignItems="center" gutterSize="s" wrap>
-                <EuiFlexItem grow={false}>
-                  <EuiButton
-                    fill
-                    isDisabled={isSyncing}
-                    isLoading={isSyncing}
-                    onClick={async () => {
-                      if (isSyncing) return;
-                      setBanner(null);
-                      setIsSyncingYaraForge(true);
-                      try {
-                        const result = (await http.post('/api/xdr-defense/yara/forge-core/sync', {
-                          body: JSON.stringify({}),
-                        })) as {
-                          status: 'completed' | 'running';
-                          release_tag?: string;
-                          parallel_workers: number;
-                          attempted: number;
-                          loaded: number;
-                          imported: number;
-                          unchanged: number;
-                          removed?: number;
-                          active_rules_queued: number;
-                          load_failures: number;
-                          rollout: { target_agent_commands: number; created: number; deduplicated: number };
-                          errors: string[];
-                          metadata?: ForgeCoreSyncMetadata;
-                        };
-                        if (result.metadata) setYaraForgeSyncStatus(result.metadata);
-                        await refreshAll();
-                        const errorText =
-                          Array.isArray(result.errors) && result.errors.length > 0
-                            ? `\nIssues:\n${result.errors.join('\n')}`
-                            : '';
-                        notifications.toasts.addSuccess(
-                          `YARA Forge sync ${result.status === 'running' ? 'already in progress' : 'completed'}${result.release_tag ? ` for release ${result.release_tag}` : ''}. Imported ${result.imported}, removed ${result.removed ?? 0} rules.`
-                        );
-                        setBanner({
-                          kind: 'success',
-                          message: `Forge sync ${result.status === 'running' ? 'already in progress' : 'completed'} with ${result.parallel_workers} workers. Attempted ${result.attempted}, loaded ${result.loaded}, imported ${result.imported}, unchanged ${result.unchanged}, removed ${result.removed ?? 0}, load failures ${result.load_failures}. Active rules queued ${result.active_rules_queued}. Rollout targets ${result.rollout?.target_agent_commands ?? 0}, created ${result.rollout?.created ?? 0}, deduplicated ${result.rollout?.deduplicated ?? 0}.${errorText}`,
-                        });
-                      } catch (err: unknown) {
-                        notifications.toasts.addDanger({ title: 'Unable to sync YARA Forge Core', text: (err as Error)?.message });
-                        setBanner({ kind: 'error', message: `Failed to sync YARA Forge Core: ${String((err as Error)?.message ?? err)}` });
-                      } finally {
-                        await refreshYaraForgeSyncStatus();
-                        setIsSyncingYaraForge(false);
-                      }
-                    }}
-                  >
-                    {syncButtonLabel}
-                  </EuiButton>
-                </EuiFlexItem>
-                <EuiFlexItem grow={false}>
-                  <EuiButton onClick={() => setDrawerOpen('yara')}>Add Custom Content</EuiButton>
-                </EuiFlexItem>
-              </EuiFlexGroup>
+              <EuiText size="s" color="subdued">
+                <p>
+                  Agent rollout state is based on per-agent reports. Agents without recent reports are marked
+                  offline/unknown (stale after {yaraRolloutStaleAfterMinutes} minutes).
+                </p>
+              </EuiText>
             </EuiFlexItem>
             <EuiFlexItem grow={false}>
-              <EuiFlexGroup alignItems="center" gutterSize="s" wrap>
-                <EuiFlexItem grow={false}>
-                  <EuiButton
-                    size="s"
-                    isDisabled={!hasSelection || isYaraBusy}
-                    isLoading={isYaraBusy}
-                    onClick={async () => {
-                      if (!hasSelection || isYaraBusy) return;
-                      setIsYaraBusy(true);
-                      setBanner(null);
-                      let ok = 0; let fail = 0;
-                      for (const id of selectedList) {
-                        try {
-                          await http.put(`/api/xdr-defense/yara/rules/${encodeURIComponent(id)}`, { body: JSON.stringify({ enabled: true }) });
-                          ok++;
-                        } catch { fail++; }
-                      }
-                      await refreshAll();
-                      setIsYaraBusy(false);
-                      setBanner({ kind: 'success', message: `Enabled ${ok} rule(s)${fail > 0 ? `, failed ${fail}` : ''}.` });
-                    }}
-                  >
-                    Enable
-                  </EuiButton>
-                </EuiFlexItem>
-                <EuiFlexItem grow={false}>
-                  <EuiButton
-                    size="s"
-                    isDisabled={!hasSelection || isYaraBusy}
-                    isLoading={isYaraBusy}
-                    onClick={async () => {
-                      if (!hasSelection || isYaraBusy) return;
-                      setIsYaraBusy(true);
-                      setBanner(null);
-                      let ok = 0; let fail = 0;
-                      for (const id of selectedList) {
-                        try {
-                          await http.put(`/api/xdr-defense/yara/rules/${encodeURIComponent(id)}`, { body: JSON.stringify({ enabled: false }) });
-                          ok++;
-                        } catch { fail++; }
-                      }
-                      await refreshAll();
-                      setIsYaraBusy(false);
-                      setBanner({ kind: 'success', message: `Disabled ${ok} rule(s)${fail > 0 ? `, failed ${fail}` : ''}.` });
-                    }}
-                  >
-                    Disable
-                  </EuiButton>
-                </EuiFlexItem>
-                <EuiFlexItem grow={false}>
-                  <EuiButton
-                    color="danger"
-                    fill
-                    size="s"
-                    isDisabled={selectedDeletable.length === 0 || isYaraBusy}
-                    isLoading={isYaraBusy}
-                    onClick={async () => {
-                      if (selectedDeletable.length === 0 || isYaraBusy) return;
-                      if (!window.confirm(`Delete ${selectedDeletable.length} selected rule(s)? This will queue rollout delete commands for enrolled agents.`)) return;
-                      setIsYaraBusy(true);
-                      setBanner(null);
-                      let deleted = 0; let failed = 0;
-                      const errors: string[] = [];
-                      for (const rule of selectedDeletable) {
-                        try {
-                          await http.delete(`/api/xdr-defense/yara/rules/${encodeURIComponent(rule.id)}`);
-                          deleted++;
-                        } catch (err: unknown) {
-                          failed++;
-                          errors.push(`${rule.name}: ${String((err as Error)?.message ?? err)}`);
-                        }
-                      }
-                      setSelectedYaraIds(new Set());
-                      await refreshAll();
-                      setIsYaraBusy(false);
-                      setBanner({ kind: 'success', message: `Bulk delete completed. Deleted ${deleted}${failed > 0 ? `, failed ${failed}` : ''}.${errors.length > 0 ? `\n${errors.join(' | ')}` : ''}` });
-                    }}
-                  >
-                    Delete
-                  </EuiButton>
-                </EuiFlexItem>
-                {hasSelection && (
-                  <EuiFlexItem grow={false}>
-                    <EuiText size="xs" color="subdued"><p>{selectedList.length} selected</p></EuiText>
-                  </EuiFlexItem>
-                )}
-              </EuiFlexGroup>
+              <EuiButtonEmpty
+                size="xs"
+                onClick={async () => {
+                  await refreshYaraForgeSyncStatus();
+                  await refreshBundleMetadata();
+                  await refreshYaraRolloutStatus();
+                }}
+              >
+                Refresh Rollout Status
+              </EuiButtonEmpty>
             </EuiFlexItem>
           </EuiFlexGroup>
-
-          <EuiHorizontalRule margin="s" />
-
-          {/* Search */}
-          <EuiFieldSearch
-            value={yaraSearchQuery}
-            onChange={(e) => {
-              setYaraSearchQuery(e.target.value);
-              setYaraPageIndex(0);
-            }}
-            placeholder="Search..."
-            fullWidth
-            aria-label="Search YARA rules by name or tags"
-          />
 
           <EuiSpacer size="m" />
 
-          {/* Table with horizontal scroll, max height */}
           <div style={{ overflowX: 'auto', overflowY: 'auto', maxHeight: '55vh' }}>
-            <div style={{ display: 'inline-block', minWidth: 1280 }}>
+            <div style={{ display: 'inline-block', minWidth: 1400 }}>
               <EuiInMemoryTable
-                itemId="id"
-                items={pagedYaraRules}
-                columns={yaraColumns as any}
+                itemId={(row: YaraRolloutStatusRow) => `${row.agent}-${row.policy}`}
+                items={yaraRolloutRows}
+                columns={yaraRolloutColumns as any}
                 loading={isLoading}
                 pagination={false}
                 sorting={false}
@@ -1213,7 +1087,6 @@ export const XdrDefenseApp: React.FC<XdrDefenseAppProps> = ({ http, notification
 
           <EuiSpacer size="s" />
 
-          {/* Pagination — coordinator style */}
           <EuiFlexGroup alignItems="center" justifyContent="spaceBetween" responsive={false}>
             <EuiFlexItem grow={false}>
               <EuiFlexGroup alignItems="center" gutterSize="s" responsive={false}>
@@ -1223,33 +1096,39 @@ export const XdrDefenseApp: React.FC<XdrDefenseAppProps> = ({ http, notification
                 <EuiFlexItem grow={false}>
                   <EuiSelect
                     compressed
-                    value={String(yaraPageSize)}
+                    value={String(yaraRolloutPageSize)}
                     onChange={(e) => {
-                      setYaraPageSize(Number(e.target.value));
-                      setYaraPageIndex(0);
+                      setYaraRolloutPageSize(Number(e.target.value));
+                      setYaraRolloutPageIndex(0);
                     }}
                     options={pageSizeOptions.map((o) => ({ value: String(o.value), text: o.text }))}
                   />
+                </EuiFlexItem>
+                <EuiFlexItem grow={false}>
+                  <EuiText size="s" color="subdued"><span>{yaraRolloutTotal} agent entries</span></EuiText>
                 </EuiFlexItem>
               </EuiFlexGroup>
             </EuiFlexItem>
             <EuiFlexItem grow={false}>
               <EuiPagination
-                pageCount={yaraTotalPages}
-                activePage={yaraCurrentPage}
-                onPageClick={setYaraPageIndex}
+                pageCount={yaraRolloutTotalPages}
+                activePage={rolloutCurrentPage}
+                onPageClick={setYaraRolloutPageIndex}
               />
             </EuiFlexItem>
           </EuiFlexGroup>
         </EuiPanel>
 
-        {/* YARA drawer */}
         {drawerOpen === 'yara' && (
           <EuiFlyout onClose={() => setDrawerOpen('none')} size="s" ownFocus>
             <EuiFlyoutHeader hasBorder>
               <EuiTitle size="m"><h2>Add Custom YARA Content</h2></EuiTitle>
             </EuiFlyoutHeader>
             <EuiFlyoutBody>
+              <EuiCallOut size="s" title="Stored in .xdr-defense-yara">
+                <p>After saving custom content, click Rollout YARA to All Agents to publish the refreshed signed bundle.</p>
+              </EuiCallOut>
+              <EuiSpacer size="m" />
               <EuiFlexGroup>
                 <EuiFlexItem>
                   <EuiFormRow label="Name">
@@ -1308,7 +1187,7 @@ export const XdrDefenseApp: React.FC<XdrDefenseAppProps> = ({ http, notification
                         setYaraFormSeverity('medium');
                         setYaraFormTags('');
                         await refreshAll();
-                        setBanner({ kind: 'success', message: 'Custom YARA rule added and rollout queued for enrolled agents.' });
+                        setBanner({ kind: 'success', message: 'Custom YARA content added. Click Rollout YARA to All Agents to publish the updated bundle.' });
                       } catch (err: unknown) {
                         setBanner({ kind: 'error', message: `Failed to add YARA rule: ${String((err as Error)?.message ?? err)}` });
                       }

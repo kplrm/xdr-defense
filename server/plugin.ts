@@ -2,6 +2,8 @@ import { registerArtifactRoutes } from './routes/artifacts';
 import { registerBehavioralRoutes } from './routes/behavioral';
 import { ensureHashesDataView } from './lib/hashes_data_view';
 import { ensureHashesIndex } from './lib/hashes_index';
+import { ensureYaraDataView } from './lib/yara_data_view';
+import { ensureYaraIndex } from './lib/yara_index';
 import { mbAutoUpdateScheduler } from './lib/mb_auto_update';
 import { registerHashRoutes } from './routes/hashes';
 import { registerPolicyRoutes } from './routes/policies';
@@ -19,6 +21,11 @@ export class XdrDefenseServerPlugin {
         // Keep plugin boot resilient; routes also lazily ensure on first use.
         // eslint-disable-next-line no-console
         console.error('xdr-defense: failed to initialize hashes index', err);
+      });
+      ensureYaraIndex(bootstrapClient).catch((err) => {
+        // Keep plugin boot resilient; routes also lazily ensure on first use.
+        // eslint-disable-next-line no-console
+        console.error('xdr-defense: failed to initialize yara index', err);
       });
       mbAutoUpdateScheduler.init(bootstrapClient);
     }
@@ -41,6 +48,10 @@ export class XdrDefenseServerPlugin {
       ensureHashesDataView(internalRepo).catch((err) => {
         // eslint-disable-next-line no-console
         console.error('xdr-defense: failed to install hashes data view', err);
+      });
+      ensureYaraDataView(internalRepo).catch((err) => {
+        // eslint-disable-next-line no-console
+        console.error('xdr-defense: failed to install yara data view', err);
       });
     }
 

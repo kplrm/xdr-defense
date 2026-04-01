@@ -3,27 +3,23 @@ declare const require: any;
 import {
   addCustomYaraRule,
   buildSignedYaraBundle,
+  bulkSyncForgeCoreRules,
   deleteCustomYaraRule,
-  getExistingForgeCoreRuleState,
   getSigningReadiness,
-  getYaraRule,
+  listExistingForgeCoreRulesForSync,
   listYaraRules,
-  upsertForgeCoreYaraRule,
   updateYaraRule,
   validateYaraContent
-} from '../lib/yara_store';
+} from '../lib/yara_index';
 import { fetchLatestYaraForgeCoreRelease } from '../lib/yara_forge_release';
 import { getYaraForgeSyncState, updateYaraForgeSyncState } from '../lib/upstream_sync_store';
 import {
-  acknowledgeRollout,
-  dispatchRolloutForAgents,
   ingestYaraRolloutStatusReport,
-  listEnrolledAgents,
-  listRolloutStatus,
+  listYaraRolloutStatus,
+  queueYaraRolloutRequest,
   ruleHealthIndexForTimestamp,
-  ruleHealthTimestamp,
-  retryRetryableCommands
-} from '../lib/yara_rollout';
+  ruleHealthTimestamp
+} from '../lib/yara_rollout_status';
 
 const { schema } = require('@osd/config-schema');
 
@@ -67,6 +63,23 @@ interface ForgeCoreSyncMetadata {
 
 let forgeCoreSyncMetadata: ForgeCoreSyncMetadata = { status: 'idle' };
 let forgeCoreSyncInFlight = false;
+let forgeCoreSyncStartedAtMs = 0;
+
+// Maximum time (ms) before a stale in-flight lock is automatically released.
+// With bulk operations the sync finishes in seconds; 10 minutes is a safe ceiling.
+const FORGE_SYNC_STALE_AFTER_MS = 10 * 60 * 1000;
+const YARA_ROLLOUT_CONFIRMATION_TIMEOUT_MS = 20 * 1000;
+const YARA_ROLLOUT_CONFIRMATION_POLL_MS = 1000;
+
+interface YaraRolloutConfirmationSummary {
+  target_agents: number;
+  confirmed_agents: number;
+  applied: number;
+  partial: number;
+  failed: number;
+  pending: number;
+  timed_out: boolean;
+}
 
 function persistedSyncMetadataSnapshot(): ForgeCoreSyncMetadata {
   const persisted = getYaraForgeSyncState();
@@ -108,6 +121,103 @@ function syncMetadataSnapshot(): ForgeCoreSyncMetadata {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function countRolloutTargetAgents(client: any, policyId: string): Promise<number> {
+  try {
+    if (policyId === 'global-default') {
+      const response = await client.count({
+        index: 'xdr-agents',
+        body: { query: { match_all: {} } }
+      });
+      return Math.max(0, Number(response?.body?.count ?? 0));
+    }
+
+    const response = await client.count({
+      index: 'xdr-agents',
+      body: { query: { term: { policy_id: policyId } } }
+    });
+    return Math.max(0, Number(response?.body?.count ?? 0));
+  } catch {
+    return 0;
+  }
+}
+
+async function summarizeYaraRolloutConfirmation(
+  client: any,
+  policyId: string,
+  bundleVersion: number,
+  targetAgents: number
+): Promise<YaraRolloutConfirmationSummary> {
+  let applied = 0;
+  let partial = 0;
+  let failed = 0;
+  let confirmed = 0;
+
+  try {
+    const response = await client.search({
+      index: '.xdr-defense-yara-rollout-status',
+      size: 10000,
+      body: {
+        query: {
+          bool: {
+            must: [
+              { term: { policy_id: policyId } },
+              { term: { bundle_version: bundleVersion } }
+            ]
+          }
+        },
+        _source: ['agent_id', 'state']
+      }
+    });
+
+    const hits = Array.isArray(response?.body?.hits?.hits) ? response.body.hits.hits : [];
+    confirmed = hits.length;
+    for (const hit of hits) {
+      const state = String(hit?._source?.state ?? '').toLowerCase();
+      if (state === 'applied') {
+        applied += 1;
+      } else if (state === 'partial') {
+        partial += 1;
+      } else if (state === 'failed') {
+        failed += 1;
+      }
+    }
+  } catch {
+    confirmed = 0;
+  }
+
+  const pending = Math.max(0, targetAgents - confirmed);
+  return {
+    target_agents: targetAgents,
+    confirmed_agents: confirmed,
+    applied,
+    partial,
+    failed,
+    pending,
+    timed_out: pending > 0
+  };
+}
+
+async function waitForYaraRolloutConfirmation(
+  client: any,
+  policyId: string,
+  bundleVersion: number
+): Promise<YaraRolloutConfirmationSummary> {
+  const targetAgents = await countRolloutTargetAgents(client, policyId);
+  const deadline = Date.now() + YARA_ROLLOUT_CONFIRMATION_TIMEOUT_MS;
+
+  let latest = await summarizeYaraRolloutConfirmation(client, policyId, bundleVersion, targetAgents);
+  while (latest.pending > 0 && Date.now() < deadline) {
+    await sleep(YARA_ROLLOUT_CONFIRMATION_POLL_MS);
+    latest = await summarizeYaraRolloutConfirmation(client, policyId, bundleVersion, targetAgents);
+  }
+
+  if (latest.pending > 0) {
+    return { ...latest, timed_out: true };
+  }
+
+  return { ...latest, timed_out: false };
 }
 
 async function simulateAgainstRecentDocs(
@@ -206,26 +316,6 @@ function scopedOsClient(ctx: any): any | null {
   return null;
 }
 
-async function dispatchRuleRollout(ctx: any, rule: { id: string; name: string; updatedAt: string }, action: 'activate' | 'deactivate' | 'delete') {
-  const client = scopedOsClient(ctx);
-  if (!client) {
-    return {
-      queued: false,
-      reason: 'OpenSearch scoped client unavailable for rollout dispatch.'
-    };
-  }
-
-  const agents = await listEnrolledAgents(client);
-  const dispatch = await dispatchRolloutForAgents(client, agents, rule, action);
-  return {
-    queued: true,
-    action,
-    agents: agents.length,
-    dispatched: dispatch.dispatched,
-    deduplicated: dispatch.deduplicated
-  };
-}
-
 // ACK validation schema (shared between current and legacy routes)
 const ackValidationSchema = {
   body: schema.object({
@@ -284,7 +374,7 @@ async function handleRolloutStatus(ctx: any, res: any) {
       });
     }
 
-    const status = await listRolloutStatus(client);
+    const status = await listYaraRolloutStatus(client, { page: 1, pageSize: 100 });
     return res.ok({ body: status });
   } catch (err: any) {
     return res.customError({
@@ -306,11 +396,32 @@ async function handleRolloutRetry(ctx: any, res: any) {
         body: { message: 'OpenSearch scoped client unavailable.' }
       });
     }
-    const result = await retryRetryableCommands(client);
-    const status = await listRolloutStatus(client);
+    const policyId = 'global-default';
+    const bundleResult = await buildSignedYaraBundle(client, policyId);
+    if (!bundleResult.bundle) {
+      return res.customError({
+        statusCode: 409,
+        body: {
+          message: 'No cached YARA bundle is available to retry.',
+          details: bundleResult.error ?? 'Build cached bundle first.'
+        }
+      });
+    }
+
+    const request = await queueYaraRolloutRequest(client, {
+      policy_id: policyId,
+      bundle_version: bundleResult.bundle.bundle_version,
+      generated_at: bundleResult.bundle.generated_at,
+      requested_at: new Date().toISOString(),
+      rule_count: bundleResult.bundle.rules.length
+    });
+    const confirmation = await waitForYaraRolloutConfirmation(client, policyId, request.bundle_version);
+    const status = await listYaraRolloutStatus(client, { page: 1, pageSize: 100 });
     return res.ok({
       body: {
-        retried: result.retried,
+        retried: 1,
+        bundle_version: request.bundle_version,
+        confirmation,
         status
       }
     });
@@ -326,35 +437,7 @@ async function handleRolloutRetry(ctx: any, res: any) {
 }
 
 async function handleRolloutAck(ctx: any, req: any, res: any) {
-  try {
-    const client = scopedOsClient(ctx);
-    if (!client) {
-      return res.customError({
-        statusCode: 503,
-        body: { message: 'OpenSearch scoped client unavailable.' }
-      });
-    }
-
-    const ackResult = await acknowledgeRollout(client, req.body ?? {});
-    if (!ackResult.updated) {
-      return res.customError({
-        statusCode: 404,
-        body: {
-          message: ackResult.reason ?? 'Rollout command not found for ACK.'
-        }
-      });
-    }
-
-    return res.ok({ body: { acknowledged: true } });
-  } catch (err: any) {
-    return res.customError({
-      statusCode: 500,
-      body: {
-        message: 'Failed to acknowledge rollout command.',
-        details: String(err?.message ?? err)
-      }
-    });
-  }
+  return res.ok({ body: { acknowledged: true, legacy: true, request: req.body ?? {} } });
 }
 
 async function handleRolloutStatusIngestion(ctx: any, req: any, res: any) {
@@ -388,7 +471,14 @@ export function registerYaraRoutes(router: any): void {
     },
     async (_ctx: unknown, _req: unknown, res: any) => {
       try {
-        const rules = listYaraRules();
+        const client = scopedOsClient(_ctx);
+        if (!client) {
+          return res.customError({
+            statusCode: 503,
+            body: { message: 'OpenSearch scoped client unavailable.' }
+          });
+        }
+        const rules = await listYaraRules(client);
         return res.ok({ body: { rules } });
       } catch (err: any) {
         return res.customError({
@@ -416,7 +506,11 @@ export function registerYaraRoutes(router: any): void {
     },
     async (ctx: any, req: any, res: any) => {
       try {
-        const created = addCustomYaraRule(req.body ?? {});
+        const client = scopedOsClient(ctx);
+        if (!client) {
+          return res.customError({ statusCode: 503, body: { message: 'OpenSearch scoped client unavailable.' } });
+        }
+        const created = await addCustomYaraRule(client, req.body ?? {});
         const statusCode = created.validation.status === 'valid' ? 200 : 400;
         if (statusCode === 400) {
           return res.customError({
@@ -428,10 +522,7 @@ export function registerYaraRoutes(router: any): void {
             }
           });
         }
-        const rollout = created.enabled
-          ? await dispatchRuleRollout(ctx, { id: created.id, name: created.name, updatedAt: created.updatedAt }, 'activate')
-          : { queued: false, reason: 'Rule is disabled due to validation state.' };
-        return res.ok({ body: { ...created, rollout } });
+        return res.ok({ body: { ...created } });
       } catch (err: any) {
         return res.customError({
           statusCode: 500,
@@ -460,9 +551,12 @@ export function registerYaraRoutes(router: any): void {
     },
     async (ctx: any, req: any, res: any) => {
       try {
+        const client = scopedOsClient(ctx);
+        if (!client) {
+          return res.customError({ statusCode: 503, body: { message: 'OpenSearch scoped client unavailable.' } });
+        }
         const { id } = req.params;
-        const previous = getYaraRule(id);
-        const result = updateYaraRule(id, req.body ?? {});
+        const result = await updateYaraRule(client, id, req.body ?? {});
         if (!result.updated) {
           const code = result.error === 'Rule not found.' ? 404 : 400;
           return res.customError({
@@ -472,24 +566,7 @@ export function registerYaraRoutes(router: any): void {
             }
           });
         }
-
-        let rollout: any = { queued: false, reason: 'No rollout action required.' };
-        if (previous && previous.enabled !== result.updated.enabled) {
-          rollout = await dispatchRuleRollout(
-            ctx,
-            { id: result.updated.id, name: result.updated.name, updatedAt: result.updated.updatedAt },
-            result.updated.enabled ? 'activate' : 'deactivate'
-          );
-        } else if (result.updated.enabled) {
-          // Keep active rule content aligned on agents when content/severity/tags change.
-          rollout = await dispatchRuleRollout(
-            ctx,
-            { id: result.updated.id, name: result.updated.name, updatedAt: result.updated.updatedAt },
-            'activate'
-          );
-        }
-
-        return res.ok({ body: { ...result.updated, rollout } });
+        return res.ok({ body: { ...result.updated } });
       } catch (err: any) {
         return res.customError({
           statusCode: 500,
@@ -511,8 +588,11 @@ export function registerYaraRoutes(router: any): void {
     },
     async (ctx: any, req: any, res: any) => {
       try {
-        const target = getYaraRule(req.params.id);
-        const result = deleteCustomYaraRule(req.params.id);
+        const client = scopedOsClient(ctx);
+        if (!client) {
+          return res.customError({ statusCode: 503, body: { message: 'OpenSearch scoped client unavailable.' } });
+        }
+        const result = await deleteCustomYaraRule(client, req.params.id);
         if (!result.deleted) {
           const code = result.error === 'Rule not found.' ? 404 : 400;
           return res.customError({
@@ -522,12 +602,7 @@ export function registerYaraRoutes(router: any): void {
             }
           });
         }
-
-        const rollout = target
-          ? await dispatchRuleRollout(ctx, { id: target.id, name: target.name, updatedAt: target.updatedAt }, 'delete')
-          : { queued: false, reason: 'Deleted rule was not found for rollout dispatch.' };
-
-        return res.ok({ body: { deleted: true, id: req.params.id, rollout } });
+        return res.ok({ body: { deleted: true, id: req.params.id } });
       } catch (err: any) {
         return res.customError({
           statusCode: 500,
@@ -584,8 +659,12 @@ export function registerYaraRoutes(router: any): void {
         })
       }
     },
-    async (_ctx: unknown, req: any, res: any) => {
+    async (ctx: any, req: any, res: any) => {
       try {
+        const client = scopedOsClient(ctx);
+        if (!client) {
+          return res.customError({ statusCode: 503, body: { message: 'OpenSearch scoped client unavailable.' } });
+        }
         const policyId = String(req.query?.policy_id ?? 'global-default');
         const readiness = getSigningReadiness();
         if (!readiness.ready) {
@@ -598,7 +677,7 @@ export function registerYaraRoutes(router: any): void {
           });
         }
 
-        const result = buildSignedYaraBundle(policyId);
+        const result = await buildSignedYaraBundle(client, policyId);
         if (!result.bundle) {
           return res.customError({
             statusCode: 503,
@@ -628,6 +707,12 @@ export function registerYaraRoutes(router: any): void {
       validate: false
     },
     async (ctx: any, _req: any, res: any) => {
+      // Auto-release a stale lock if the previous sync has been in-flight for too long.
+      if (forgeCoreSyncInFlight && Date.now() - forgeCoreSyncStartedAtMs > FORGE_SYNC_STALE_AFTER_MS) {
+        forgeCoreSyncInFlight = false;
+        forgeCoreSyncStartedAtMs = 0;
+      }
+
       if (forgeCoreSyncInFlight) {
         const snapshot = syncMetadataSnapshot();
         return res.ok({
@@ -658,6 +743,7 @@ export function registerYaraRoutes(router: any): void {
       const startedAt = new Date().toISOString();
       const syncId = `forge-core-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       forgeCoreSyncInFlight = true;
+      forgeCoreSyncStartedAtMs = Date.now();
       forgeCoreSyncMetadata = {
         status: 'processing',
         phase: 'downloading',
@@ -680,6 +766,11 @@ export function registerYaraRoutes(router: any): void {
       });
 
       try {
+        const client = scopedOsClient(ctx);
+        if (!client) {
+          throw new Error('OpenSearch scoped client unavailable.');
+        }
+
         const release = await fetchLatestYaraForgeCoreRelease();
 
         forgeCoreSyncMetadata = {
@@ -737,70 +828,50 @@ export function registerYaraRoutes(router: any): void {
         let processedRolloutRules = 0;
         const importErrors: string[] = [];
 
-        const seenRuleIds = new Set<string>();
-        const rolloutCandidates: Array<{ id: string; name: string; updatedAt: string; action: 'activate' | 'deactivate' | 'delete' }> = [];
-        for (const source of release.sources) {
-          seenRuleIds.add(source.id);
-          const existingState = getExistingForgeCoreRuleState(source.id);
-          const upserted = upsertForgeCoreYaraRule({
-            id: source.id,
-            name: source.name,
-            content: source.content,
-            severity: source.severity,
-            tags: source.tags,
-            enabled: existingState ? existingState.enabled : true
-          });
+        // Fetch all existing forge-core rule states in one search query
+        // (avoids 5000+ individual GET calls that caused the sync to appear stuck).
+        const existingForgeCoreMap = await listExistingForgeCoreRulesForSync(client);
+        const seenRuleIds = new Set(release.sources.map((s) => String(s.id)));
 
-          if (!upserted.changed) {
-            unchanged += 1;
-          } else {
-            imported += 1;
-          }
+        // Bulk-sync: compare in memory, write changes in one bulk operation.
+        const syncResult = await bulkSyncForgeCoreRules(client, release.sources, existingForgeCoreMap);
+        imported = syncResult.imported;
+        unchanged = syncResult.unchanged;
+        activeRulesQueued = syncResult.activeRulesQueued;
 
-          if (upserted.rule.enabled) {
-            activeRulesQueued += 1;
-          }
-
-          // Pre-filter rollout to only changed/new rules; unchanged rules are skipped.
-          if (upserted.changed) {
-            if (upserted.rule.enabled) {
-              rolloutCandidates.push({
-                id: upserted.rule.id,
-                name: upserted.rule.name,
-                updatedAt: upserted.rule.updatedAt,
-                action: 'activate'
-              });
-            } else if (existingState?.enabled) {
-              rolloutCandidates.push({
-                id: upserted.rule.id,
-                name: upserted.rule.name,
-                updatedAt: upserted.rule.updatedAt,
-                action: 'deactivate'
-              });
+        // Remove forge-core rules that are no longer present in the upstream release.
+        for (const existingId of existingForgeCoreMap.keys()) {
+          if (!seenRuleIds.has(existingId)) {
+            const deleted = await deleteCustomYaraRule(client, existingId);
+            if (deleted.deleted) {
+              removed += 1;
+            } else {
+              importErrors.push(`${existingId}: failed to remove stale Forge rule.`);
             }
           }
         }
 
-        const existingForgeRules = listYaraRules().filter((rule) => rule.source === 'forge-core');
-        for (const existingRule of existingForgeRules) {
-          if (seenRuleIds.has(existingRule.id)) {
-            continue;
-          }
-
-          const target = getYaraRule(existingRule.id);
-          const deleted = deleteCustomYaraRule(existingRule.id);
-          if (!deleted.deleted) {
-            importErrors.push(`${existingRule.id}: failed to remove stale Forge rule.`);
-            continue;
-          }
-
-          removed += 1;
-          if (target?.enabled) {
-            rolloutCandidates.push({ id: target.id, name: target.name, updatedAt: target.updatedAt, action: 'delete' });
-          }
+        const policyId = 'global-default';
+        const bundleResult = await buildSignedYaraBundle(client, policyId);
+        if (!bundleResult.bundle) {
+          throw new Error(bundleResult.error ?? 'Failed to build cached YARA bundle.');
         }
 
-        const plannedRolloutRules = rolloutCandidates.length;
+        const agentCountResponse = await client.count({
+          index: 'xdr-agents',
+          body: { query: { term: { policy_id: policyId } } }
+        }).catch(() => ({ body: { count: 0 } }));
+        const targetAgentCount = Number(agentCountResponse?.body?.count ?? 0);
+
+        const request = await queueYaraRolloutRequest(client, {
+          policy_id: policyId,
+          bundle_version: bundleResult.bundle.bundle_version,
+          generated_at: bundleResult.bundle.generated_at,
+          requested_at: new Date().toISOString(),
+          rule_count: bundleResult.bundle.rules.length
+        });
+
+        const plannedRolloutRules = bundleResult.bundle.rules.length;
 
         forgeCoreSyncMetadata = {
           ...forgeCoreSyncMetadata,
@@ -813,13 +884,13 @@ export function registerYaraRoutes(router: any): void {
           load_failures: 0,
           active_rules_queued: activeRulesQueued,
           rollout: {
-            target_agent_commands: 0,
-            created: 0,
+            target_agent_commands: targetAgentCount,
+            created: targetAgentCount,
             deduplicated: 0,
             planned_rules: plannedRolloutRules,
-            processed_rules: 0
+            processed_rules: plannedRolloutRules
           },
-          message: 'Creating rollout commands for validated rules.'
+          message: 'Verified rules, built cached bundle, and queued agent rollout.'
         };
         updateYaraForgeSyncState({
           phase: 'rollout',
@@ -831,49 +902,17 @@ export function registerYaraRoutes(router: any): void {
           load_failures: 0,
           active_rules_queued: activeRulesQueued,
           rollout: {
-            target_agent_commands: 0,
-            created: 0,
+            target_agent_commands: targetAgentCount,
+            created: targetAgentCount,
             deduplicated: 0,
             planned_rules: plannedRolloutRules,
-            processed_rules: 0
+            processed_rules: plannedRolloutRules
           }
         });
-
-        for (const candidate of rolloutCandidates) {
-          const rollout = await dispatchRuleRollout(ctx, candidate, candidate.action);
-          if (!rollout.queued) {
-            processedRolloutRules += 1;
-            const rolloutProgress = {
-              target_agent_commands: totalDispatchTargets,
-              created: totalDispatchCreated,
-              deduplicated: totalDispatchDeduplicated,
-              planned_rules: plannedRolloutRules,
-              processed_rules: processedRolloutRules
-            };
-            forgeCoreSyncMetadata = {
-              ...forgeCoreSyncMetadata,
-              rollout: rolloutProgress
-            };
-            updateYaraForgeSyncState({ rollout: rolloutProgress });
-            continue;
-          }
-          totalDispatchTargets += Number(rollout.agents ?? 0);
-          totalDispatchCreated += Number(rollout.dispatched ?? 0);
-          totalDispatchDeduplicated += Number(rollout.deduplicated ?? 0);
-          processedRolloutRules += 1;
-          const rolloutProgress = {
-            target_agent_commands: totalDispatchTargets,
-            created: totalDispatchCreated,
-            deduplicated: totalDispatchDeduplicated,
-            planned_rules: plannedRolloutRules,
-            processed_rules: processedRolloutRules
-          };
-          forgeCoreSyncMetadata = {
-            ...forgeCoreSyncMetadata,
-            rollout: rolloutProgress
-          };
-          updateYaraForgeSyncState({ rollout: rolloutProgress });
-        }
+        totalDispatchTargets = targetAgentCount;
+        totalDispatchCreated = targetAgentCount;
+        totalDispatchDeduplicated = 0;
+        processedRolloutRules = plannedRolloutRules;
 
         const completedAt = new Date().toISOString();
         updateYaraForgeSyncState({
@@ -892,8 +931,8 @@ export function registerYaraRoutes(router: any): void {
           load_failures: 0,
           active_rules_queued: activeRulesQueued,
           rollout: {
-            target_agent_commands: totalDispatchTargets,
-            created: totalDispatchCreated,
+            target_agent_commands: request.bundle_version > 0 ? totalDispatchTargets : 0,
+            created: request.bundle_version > 0 ? totalDispatchCreated : 0,
             deduplicated: totalDispatchDeduplicated,
             planned_rules: plannedRolloutRules,
             processed_rules: processedRolloutRules
@@ -923,7 +962,7 @@ export function registerYaraRoutes(router: any): void {
             planned_rules: plannedRolloutRules,
             processed_rules: processedRolloutRules
           },
-          message: 'YARA Forge Core sync completed.',
+          message: `YARA Forge Core sync completed. Cached bundle v${request.bundle_version} queued for rollout.`,
           errors: importErrors.sort((a, b) => a.localeCompare(b))
         };
 
@@ -943,6 +982,7 @@ export function registerYaraRoutes(router: any): void {
             active_rules_queued: activeRulesQueued,
             release_tag: release.release_tag,
             asset_name: release.asset_name,
+            bundle_version: request.bundle_version,
             rollout: {
               target_agent_commands: totalDispatchTargets,
               created: totalDispatchCreated,
@@ -993,13 +1033,37 @@ export function registerYaraRoutes(router: any): void {
     }
   );
 
-  // Current endpoint: /api/xdr-defense/yara/rollouts/status
   router.get(
     {
       path: '/api/xdr-defense/yara/rollouts/status',
-      validate: false
+      validate: {
+        query: schema.object({
+          page: schema.maybe(schema.number({ min: 1, max: 100000 })),
+          pageSize: schema.maybe(schema.number({ min: 1, max: 500 }))
+        })
+      }
     },
-    async (ctx: any, _req: any, res: any) => handleRolloutStatus(ctx, res)
+    async (ctx: any, req: any, res: any) => {
+      try {
+        const client = scopedOsClient(ctx);
+        if (!client) {
+          return res.customError({ statusCode: 503, body: { message: 'OpenSearch scoped client unavailable.' } });
+        }
+        const status = await listYaraRolloutStatus(client, {
+          page: req.query?.page,
+          pageSize: req.query?.pageSize
+        });
+        return res.ok({ body: status });
+      } catch (err: any) {
+        return res.customError({
+          statusCode: 500,
+          body: {
+            message: 'Failed to load rollout status.',
+            details: String(err?.message ?? err)
+          }
+        });
+      }
+    }
   );
 
   // Legacy alias: /api/xdr-defense/yara-rollouts/status
@@ -1015,7 +1079,20 @@ export function registerYaraRoutes(router: any): void {
   router.post(
     {
       path: '/api/xdr-defense/yara/rollouts/status',
-      validate: rolloutStatusValidationSchema
+      validate: {
+        body: schema.object({
+          manager_policy_id: schema.maybe(schema.string({ minLength: 1, maxLength: 256 })),
+          policy_id: schema.maybe(schema.string({ minLength: 1, maxLength: 256 })),
+          agent_id: schema.string({ minLength: 1, maxLength: 256 }),
+          agent_hostname: schema.maybe(schema.string({ minLength: 1, maxLength: 256 })),
+          state: schema.string({ minLength: 1, maxLength: 64 }),
+          bundle_version: schema.maybe(schema.number({ min: 0 })),
+          total_rules: schema.maybe(schema.number({ min: 0 })),
+          loaded_rules: schema.maybe(schema.number({ min: 0 })),
+          failed_rules: schema.maybe(schema.arrayOf(schema.object({}, { unknowns: 'allow' }), { defaultValue: [] })),
+          reported_at: schema.maybe(schema.oneOf([schema.number({ min: 0 }), schema.string({ minLength: 1, maxLength: 128 })]))
+        })
+      }
     },
     async (ctx: any, req: any, res: any) => handleRolloutStatusIngestion(ctx, req, res)
   );
@@ -1189,8 +1266,12 @@ export function registerYaraRoutes(router: any): void {
         })
       }
     },
-    async (_ctx: unknown, req: any, res: any) => {
+    async (ctx: any, req: any, res: any) => {
       try {
+        const client = scopedOsClient(ctx);
+        if (!client) {
+          return res.customError({ statusCode: 503, body: { message: 'OpenSearch scoped client unavailable.' } });
+        }
         const policyId = String(req.body?.policy_id ?? 'global-default');
         const readiness = getSigningReadiness();
         if (!readiness.ready) {
@@ -1203,7 +1284,7 @@ export function registerYaraRoutes(router: any): void {
           });
         }
 
-        const result = buildSignedYaraBundle(policyId);
+        const result = await buildSignedYaraBundle(client, policyId);
         if (!result.bundle) {
           return res.customError({
             statusCode: 503,
@@ -1225,6 +1306,72 @@ export function registerYaraRoutes(router: any): void {
           statusCode: 500,
           body: {
             message: 'Failed to build YARA bundle.',
+            details: String(err?.message ?? err)
+          }
+        });
+      }
+    }
+  );
+
+  router.post(
+    {
+      path: '/api/xdr-defense/yara/rollout',
+      validate: {
+        body: schema.object({
+          policy_id: schema.maybe(schema.string({ minLength: 1, maxLength: 256 }))
+        })
+      }
+    },
+    async (ctx: any, req: any, res: any) => {
+      try {
+        const client = scopedOsClient(ctx);
+        if (!client) {
+          return res.customError({ statusCode: 503, body: { message: 'OpenSearch scoped client unavailable.' } });
+        }
+
+        const policyId = String(req.body?.policy_id ?? 'global-default');
+        const bundleResult = await buildSignedYaraBundle(client, policyId);
+        if (!bundleResult.bundle) {
+          return res.customError({
+            statusCode: 409,
+            body: {
+              started: false,
+              success: false,
+              message: 'No cached YARA bundle available.',
+              details: bundleResult.error ?? 'Build the cached bundle first.',
+              policy_id: policyId
+            }
+          });
+        }
+
+        const request = await queueYaraRolloutRequest(client, {
+          policy_id: policyId,
+          bundle_version: bundleResult.bundle.bundle_version,
+          generated_at: bundleResult.bundle.generated_at,
+          requested_at: new Date().toISOString(),
+          rule_count: bundleResult.bundle.rules.length
+        });
+        const confirmation = await waitForYaraRolloutConfirmation(client, policyId, request.bundle_version);
+
+        return res.ok({
+          body: {
+            started: true,
+            success: true,
+            message: confirmation.timed_out
+              ? 'Cached YARA bundle rollout requested. Waiting for some agents to confirm timed out; check YARA Rollout Status.'
+              : 'Cached YARA bundle rollout confirmed by all targeted agents.',
+            policy_id: policyId,
+            bundle_version: request.bundle_version,
+            generated_at: request.generated_at,
+            rule_count: request.rule_count,
+            confirmation
+          }
+        });
+      } catch (err: any) {
+        return res.customError({
+          statusCode: 500,
+          body: {
+            message: 'Failed to roll out YARA bundle to agents.',
             details: String(err?.message ?? err)
           }
         });

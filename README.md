@@ -1,70 +1,56 @@
 # xdr-defense
 
-OpenSearch Dashboards plugin for XDR detection/prevention management.
+`xdr-defense` is the OpenSearch Dashboards plugin that owns policy, detection content, signed bundle generation, and rollout visibility for the XDR stack.
+
+It is the control-plane authority for what the agent should detect or prevent, but it is not the endpoint runtime.
 
 ## Scope
 
-- Manage global mode (`detect`/`prevent`) and per-capability policy options.
-- Manage artifact lifecycle for YARA rules, behavioral rules, local IoC files, and malware hashes.
-- Trigger and track agent update jobs for policy/artifact rollout.
-- Host built-in OpenSearch assets:
-  - index templates/mappings for alerts, prevention actions, and agent logs
-  - ingest pipelines for normalization and enrichment
-  - correlation content for time-window detections
+`xdr-defense` owns:
 
-## Integration model
+- global detect or prevent posture
+- per-capability policy overlays
+- YARA rule lifecycle and signed YARA bundles
+- hash intelligence lifecycle and signed hash bundles
+- behavioral rule lifecycle and signed behavioral bundles
+- rollout status ingestion and operator visibility
+- rollback confirmation workflows tied to prevention and recovery
 
-- `xdr-agent` remains local-artifact-only and does not fetch remote threat feeds.
-- `xdr-defense` fetches/curates threat intelligence and packages local artifacts.
-- `xdr-coordinator` can consume `xdr-defense` APIs as source of truth for policy/artifacts.
+It does not own:
 
-## YARA Signed Bundle Setup
+- fleet enrollment or heartbeats
+- telemetry dashboards and index lifecycle for agent event streams
+- endpoint-side scanning and enforcement logic
 
-`GET /api/xdr-defense/yara/bundle` requires an Ed25519 private key in environment variable `XDR_DEFENSE_SIGNING_PRIVATE_KEY_B64`.
+Those concerns belong to `xdr-coordinator` and `xdr-agent`.
 
-Accepted key material formats after base64 decode:
+## Read Next
 
-- 32-byte raw Ed25519 seed
-- 64-byte raw private key (first 32 bytes are used as seed)
+- `docs/README.md`
+- `docs/detection-content-contract.md`
+- `docs/rollout-validation.md`
 
-Example key generation and export:
+## Current Route Families
 
-```bash
-node -e "const { randomBytes } = require('crypto'); console.log(randomBytes(32).toString('base64'));"
-export XDR_DEFENSE_SIGNING_PRIVATE_KEY_B64='<paste-base64-seed>'
-```
+- Policy: `/api/xdr-defense/policy*`
+- YARA: `/api/xdr-defense/yara*`
+- Hashes: `/api/xdr-defense/hashes*`
+- Behavioral: `/api/xdr-defense/behavioral*`
+- Signing: `/api/xdr-defense/signing/public-key`
+- Rollback confirmation: `/api/xdr-defense/rollback/confirm`
 
-If this env var is missing/invalid, bundle endpoint returns HTTP `503` with details, while YARA CRUD endpoints continue working.
+Some legacy YARA rollout aliases still exist for compatibility with older agent behavior. The canonical route family is documented in `docs/detection-content-contract.md`.
 
-## YARA API Examples
+## Design Rules
 
-```bash
-# List rules
-curl -s localhost:5601/api/xdr-defense/yara/rules
+- Keep content curation centralized in the plugin.
+- Ship signed artifacts to agents instead of pushing raw external feeds to endpoints.
+- Keep operator contracts explicit and version-tolerant where legacy rollout aliases still exist.
+- Keep the README short; treat the docs directory as the source of truth for the agent contract and rollout validation.
 
-# Add custom rule
-curl -s -X POST localhost:5601/api/xdr-defense/yara/rules \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "name":"SuspiciousEncodedPS",
-    "severity":"high",
-    "tags":["powershell","custom"],
-    "content":"rule suspicious_encoded_ps { strings: $a = \"-EncodedCommand\" nocase condition: $a }"
-  }'
-
-# Test rule content
-curl -s -X POST localhost:5601/api/xdr-defense/yara/test \
-  -H 'Content-Type: application/json' \
-  -d '{"content":"rule t { condition: true }","sample_text":"powershell","lookback_minutes":60}'
-
-# Fetch signed bundle
-curl -s 'localhost:5601/api/xdr-defense/yara/bundle?policy_id=global-default'
-```
-
-## Development
+## Build
 
 ```bash
-npm install
-npm run lint
-npm run build
+cd /home/kplrm/github/xdr-defense
+yarn build --opensearch-dashboards-version 3.5.0
 ```

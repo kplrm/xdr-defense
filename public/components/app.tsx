@@ -5,7 +5,6 @@ import {
   EuiButtonIcon,
   EuiButtonEmpty,
   EuiCallOut,
-  EuiCodeBlock,
   EuiFieldNumber,
   EuiFieldText,
   EuiFlexGroup,
@@ -65,17 +64,6 @@ interface RulesResponse {
   pageSize?: number;
   total?: number;
   totalPages?: number;
-}
-
-interface YaraTestResponse {
-  validation: RuleValidation;
-  simulation: {
-    queried: boolean;
-    lookback_minutes: number;
-    total_hits: number;
-    simulated_matches: number;
-    query_error?: string;
-  };
 }
 
 interface SignedBundle {
@@ -227,6 +215,72 @@ interface HashRolloutRetryResponse {
   generated_at: string;
 }
 
+interface ProtectionSyncResponse {
+  imported: number;
+  unchanged: number;
+  attempted: number;
+  source: string;
+  source_name: string;
+  index_name: string;
+  upstream_total_rules: number;
+  upstream_candidate_rules?: number;
+  curated_rules: number;
+  steps?: ProtectionSyncStep[];
+  source_breakdown?: ProtectionSyncSourceBreakdown[];
+}
+
+interface ProtectionSyncStep {
+  stage: string;
+  message: string;
+  at: string;
+  details?: Record<string, unknown>;
+}
+
+interface ProtectionSyncSourceBreakdown {
+  source: string;
+  attempted: number;
+  imported: number;
+  unchanged: number;
+}
+
+interface ProtectionSyncJobStatus {
+  job_id: string;
+  namespace: 'memory' | 'ransomware';
+  status: 'running' | 'completed' | 'failed';
+  created_at: string;
+  updated_at: string;
+  completed_at?: string;
+  steps: ProtectionSyncStep[];
+  result?: ProtectionSyncResponse;
+  error?: string;
+}
+
+interface ProtectionSyncJobStartResponse {
+  started: boolean;
+  already_running?: boolean;
+  job: ProtectionSyncJobStatus;
+}
+
+interface ProtectionRolloutRow {
+  agent: string;
+  policy: string;
+  state: string;
+  bundle_version?: number;
+  total_rules?: number;
+  loaded_rules?: number;
+  last_reported?: string;
+  error?: string;
+}
+
+interface ProtectionRolloutPageResponse {
+  page: number;
+  pageSize: number;
+  total: number;
+  totalPages: number;
+  stale_after_minutes: number;
+  items: ProtectionRolloutRow[];
+}
+
 interface HashFormState {
   name: string;
   enabled: boolean;
@@ -300,6 +354,14 @@ export const XdrDefenseApp: React.FC<XdrDefenseAppProps> = ({ http, notification
   const [hashRolloutTotalPages, setHashRolloutTotalPages] = useState(1);
   const [hashRolloutStaleAfterMinutes, setHashRolloutStaleAfterMinutes] = useState(30);
   const [behavioralRules, setBehavioralRules] = useState<ManagedRule[]>([]);
+  const [memoryRolloutRows, setMemoryRolloutRows] = useState<ProtectionRolloutRow[]>([]);
+  const [memoryRolloutTotal, setMemoryRolloutTotal] = useState(0);
+  const [memoryRolloutTotalPages, setMemoryRolloutTotalPages] = useState(1);
+  const [memoryRolloutStaleAfterMinutes, setMemoryRolloutStaleAfterMinutes] = useState(30);
+  const [ransomwareRolloutRows, setRansomwareRolloutRows] = useState<ProtectionRolloutRow[]>([]);
+  const [ransomwareRolloutTotal, setRansomwareRolloutTotal] = useState(0);
+  const [ransomwareRolloutTotalPages, setRansomwareRolloutTotalPages] = useState(1);
+  const [ransomwareRolloutStaleAfterMinutes, setRansomwareRolloutStaleAfterMinutes] = useState(30);
   const [bundleMetadata, setBundleMetadata] = useState<BundleMetadata | null>(null);
   const [yaraForgeSyncStatus, setYaraForgeSyncStatus] = useState<ForgeCoreSyncMetadata | null>(null);
   const [isSyncingYaraForge, setIsSyncingYaraForge] = useState(false);
@@ -309,10 +371,20 @@ export const XdrDefenseApp: React.FC<XdrDefenseAppProps> = ({ http, notification
   const [isRetryingYaraRollout, setIsRetryingYaraRollout] = useState(false);
   const [isRollingOutHashes, setIsRollingOutHashes] = useState(false);
   const [isRetryingHashRollout, setIsRetryingHashRollout] = useState(false);
+  const [isSyncingMemorySource, setIsSyncingMemorySource] = useState(false);
+  const [isSyncingRansomwareSource, setIsSyncingRansomwareSource] = useState(false);
+  const [memorySyncSteps, setMemorySyncSteps] = useState<ProtectionSyncStep[]>([]);
+  const [ransomwareSyncSteps, setRansomwareSyncSteps] = useState<ProtectionSyncStep[]>([]);
+  const [memorySyncStatusText, setMemorySyncStatusText] = useState('Idle');
+  const [ransomwareSyncStatusText, setRansomwareSyncStatusText] = useState('Idle');
+  const [isRollingOutMemory, setIsRollingOutMemory] = useState(false);
+  const [isRetryingMemoryRollout, setIsRetryingMemoryRollout] = useState(false);
+  const [isRollingOutRansomware, setIsRollingOutRansomware] = useState(false);
+  const [isRetryingRansomwareRollout, setIsRetryingRansomwareRollout] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
 
   // ---- UI state ----
-  const [drawerOpen, setDrawerOpen] = useState<'none' | 'yara' | 'hashes' | 'behavioral' | 'malwarebazaar-config'>('none');
+  const [drawerOpen, setDrawerOpen] = useState<'none' | 'yara' | 'hashes' | 'behavioral' | 'malwarebazaar-config' | 'memory' | 'ransomware'>('none');
   const [banner, setBanner] = useState<{ kind: 'success' | 'error' | 'warning'; message: string } | null>(null);
 
   // ---- YARA rollout pagination ----
@@ -322,6 +394,10 @@ export const XdrDefenseApp: React.FC<XdrDefenseAppProps> = ({ http, notification
   // ---- Hashes pagination / search / selection ----
   const [hashRolloutPageSize, setHashRolloutPageSize] = useState(20);
   const [hashRolloutPageIndex, setHashRolloutPageIndex] = useState(0);
+  const [memoryRolloutPageSize, setMemoryRolloutPageSize] = useState(20);
+  const [memoryRolloutPageIndex, setMemoryRolloutPageIndex] = useState(0);
+  const [ransomwareRolloutPageSize, setRansomwareRolloutPageSize] = useState(20);
+  const [ransomwareRolloutPageIndex, setRansomwareRolloutPageIndex] = useState(0);
 
   // ---- YARA form ----
   const [yaraFormName, setYaraFormName] = useState('');
@@ -344,12 +420,14 @@ export const XdrDefenseApp: React.FC<XdrDefenseAppProps> = ({ http, notification
   const [behavioralFormContent, setBehavioralFormContent] = useState('');
   const [behavioralFormSeverity, setBehavioralFormSeverity] = useState('medium');
   const [behavioralFormTags, setBehavioralFormTags] = useState('');
-
-  // ---- Testing ----
-  const [testSampleText, setTestSampleText] = useState('');
-  const [testLookback, setTestLookback] = useState('60');
-  const [testContent, setTestContent] = useState('');
-  const [testOutput, setTestOutput] = useState('No test run yet.');
+  const [memoryFormName, setMemoryFormName] = useState('');
+  const [memoryFormContent, setMemoryFormContent] = useState('');
+  const [memoryFormSeverity, setMemoryFormSeverity] = useState('medium');
+  const [memoryFormTags, setMemoryFormTags] = useState('');
+  const [ransomwareFormName, setRansomwareFormName] = useState('');
+  const [ransomwareFormContent, setRansomwareFormContent] = useState('');
+  const [ransomwareFormSeverity, setRansomwareFormSeverity] = useState('medium');
+  const [ransomwareFormTags, setRansomwareFormTags] = useState('');
 
   const validateCustomHashForm = useCallback((form: HashFormState): HashFormErrors => {
     const errors: HashFormErrors = {};
@@ -470,6 +548,44 @@ export const XdrDefenseApp: React.FC<XdrDefenseAppProps> = ({ http, notification
     }
   }, [http]);
 
+  const refreshMemoryRolloutStatus = useCallback(async (input?: { pageIndex?: number; pageSize?: number }) => {
+    try {
+      const pageIndex = input?.pageIndex ?? memoryRolloutPageIndex;
+      const pageSize = input?.pageSize ?? memoryRolloutPageSize;
+      const params = new URLSearchParams();
+      params.set('page', String(pageIndex + 1));
+      params.set('pageSize', String(pageSize));
+      const payload = (await http.get(`/api/xdr-defense/memory/rollouts/status?${params.toString()}`)) as ProtectionRolloutPageResponse;
+      setMemoryRolloutRows(Array.isArray(payload?.items) ? payload.items : []);
+      setMemoryRolloutTotal(Number(payload?.total ?? 0));
+      setMemoryRolloutTotalPages(Math.max(1, Number(payload?.totalPages ?? 1)));
+      setMemoryRolloutStaleAfterMinutes(Number(payload?.stale_after_minutes ?? 30));
+    } catch {
+      setMemoryRolloutRows([]);
+      setMemoryRolloutTotal(0);
+      setMemoryRolloutTotalPages(1);
+    }
+  }, [http, memoryRolloutPageIndex, memoryRolloutPageSize]);
+
+  const refreshRansomwareRolloutStatus = useCallback(async (input?: { pageIndex?: number; pageSize?: number }) => {
+    try {
+      const pageIndex = input?.pageIndex ?? ransomwareRolloutPageIndex;
+      const pageSize = input?.pageSize ?? ransomwareRolloutPageSize;
+      const params = new URLSearchParams();
+      params.set('page', String(pageIndex + 1));
+      params.set('pageSize', String(pageSize));
+      const payload = (await http.get(`/api/xdr-defense/ransomware/rollouts/status?${params.toString()}`)) as ProtectionRolloutPageResponse;
+      setRansomwareRolloutRows(Array.isArray(payload?.items) ? payload.items : []);
+      setRansomwareRolloutTotal(Number(payload?.total ?? 0));
+      setRansomwareRolloutTotalPages(Math.max(1, Number(payload?.totalPages ?? 1)));
+      setRansomwareRolloutStaleAfterMinutes(Number(payload?.stale_after_minutes ?? 30));
+    } catch {
+      setRansomwareRolloutRows([]);
+      setRansomwareRolloutTotal(0);
+      setRansomwareRolloutTotalPages(1);
+    }
+  }, [http, ransomwareRolloutPageIndex, ransomwareRolloutPageSize]);
+
   const refreshBundleMetadata = useCallback(async () => {
     try {
       const payload = (await http.get('/api/xdr-defense/yara/bundle?policy_id=global-default')) as SignedBundle;
@@ -555,8 +671,10 @@ export const XdrDefenseApp: React.FC<XdrDefenseAppProps> = ({ http, notification
       refreshYaraForgeSyncStatus(),
       refreshMalwareBazaarStatus(),
       refreshHashRolloutStatus(),
+      refreshMemoryRolloutStatus(),
+      refreshRansomwareRolloutStatus(),
     ]);
-  }, [refreshYaraRules, refreshHashRules, refreshBehavioralRules, refreshBundleMetadata, refreshYaraRolloutStatus, refreshYaraForgeSyncStatus, refreshMalwareBazaarStatus, refreshHashRolloutStatus]);
+  }, [refreshYaraRules, refreshHashRules, refreshBehavioralRules, refreshBundleMetadata, refreshYaraRolloutStatus, refreshYaraForgeSyncStatus, refreshMalwareBazaarStatus, refreshHashRolloutStatus, refreshMemoryRolloutStatus, refreshRansomwareRolloutStatus]);
 
   useEffect(() => {
     setIsLoading(true);
@@ -598,6 +716,14 @@ export const XdrDefenseApp: React.FC<XdrDefenseAppProps> = ({ http, notification
   useEffect(() => {
     refreshHashRolloutStatus();
   }, [hashRolloutPageIndex, hashRolloutPageSize, refreshHashRolloutStatus]);
+
+  useEffect(() => {
+    refreshMemoryRolloutStatus();
+  }, [memoryRolloutPageIndex, memoryRolloutPageSize, refreshMemoryRolloutStatus]);
+
+  useEffect(() => {
+    refreshRansomwareRolloutStatus();
+  }, [ransomwareRolloutPageIndex, ransomwareRolloutPageSize, refreshRansomwareRolloutStatus]);
 
   // ---------------------------------------------------------------------------
   // Rollout status columns
@@ -688,6 +814,55 @@ export const XdrDefenseApp: React.FC<XdrDefenseAppProps> = ({ http, notification
       field: 'custom_bundle_version',
       name: 'Custom Bundle Version',
       render: (value?: number) => (value !== undefined ? String(value) : '-'),
+    },
+    {
+      field: 'last_reported',
+      name: 'Last Reported',
+      render: (value?: string) => (value ? new Date(value).toLocaleString() : '-'),
+    },
+    {
+      field: 'error',
+      name: 'Error',
+      render: (value?: string) => value || '-',
+    },
+  ];
+
+  const protectionRolloutColumns = [
+    { field: 'agent', name: 'Agent' },
+    { field: 'policy', name: 'Policy' },
+    {
+      field: 'state',
+      name: 'State',
+      render: (state: string) => (
+        <EuiBadge
+          color={
+            state === 'applied'
+              ? 'success'
+              : state === 'pending'
+                ? 'warning'
+                : state === 'failed'
+                  ? 'danger'
+                  : 'hollow'
+          }
+        >
+          {state}
+        </EuiBadge>
+      ),
+    },
+    {
+      field: 'bundle_version',
+      name: 'Bundle Version',
+      render: (value?: number) => (value !== undefined ? String(value) : '-'),
+    },
+    {
+      field: 'loaded_rules',
+      name: 'Loaded Rules',
+      render: (_: number | undefined, row: ProtectionRolloutRow) => {
+        if (row.loaded_rules === undefined && row.total_rules === undefined) {
+          return '-';
+        }
+        return `${row.loaded_rules ?? 0}/${row.total_rules ?? 0}`;
+      },
     },
     {
       field: 'last_reported',
@@ -2091,195 +2266,413 @@ export const XdrDefenseApp: React.FC<XdrDefenseAppProps> = ({ http, notification
     );
   };
 
-  const renderBundleStatusTab = () => {
-    if (!bundleMetadata) {
-      return (
-        <>
-          <EuiPanel>
-            <EuiTitle size="s"><h3>Bundle Status &amp; Rollout</h3></EuiTitle>
-            <EuiSpacer size="s" />
-            <EuiText><p><strong>Current Status:</strong> No YARA bundle generated yet.</p></EuiText>
-            <EuiText><p>After adding or syncing YARA rules, build and sign a bundle for agent consumption.</p></EuiText>
-          </EuiPanel>
-          <EuiSpacer size="m" />
-          <EuiButton
-            fill
-            onClick={async () => {
-              setBanner(null);
-              try {
-                const response = (await http.post('/api/xdr-defense/yara/bundle/build', {
-                  body: JSON.stringify({ policy_id: 'global-default' }),
-                })) as SignedBundle | { bundle?: SignedBundle };
-                const bundle = (response as { bundle?: SignedBundle }).bundle ?? (response as SignedBundle);
-                setBanner({ kind: 'success', message: `Bundle built and signed: version ${bundle.bundle_version}` });
-                await refreshBundleMetadata();
-              } catch (err: unknown) {
-                setBanner({ kind: 'error', message: `Failed to build bundle: ${String((err as Error)?.message ?? err)}` });
-              }
-            }}
-          >
-            Build &amp; Sign Bundle
-          </EuiButton>
-        </>
-      );
-    }
+  const renderProtectionTab = (input: {
+    namespace: 'memory' | 'ransomware';
+    title: string;
+    description: string;
+    syncButtonLabel: string;
+    rolloutRows: ProtectionRolloutRow[];
+    rolloutTotal: number;
+    rolloutTotalPages: number;
+    staleAfterMinutes: number;
+    rolloutPageIndex: number;
+    setRolloutPageIndex: React.Dispatch<React.SetStateAction<number>>;
+    rolloutPageSize: number;
+    setRolloutPageSize: React.Dispatch<React.SetStateAction<number>>;
+    isSyncing: boolean;
+    setIsSyncing: React.Dispatch<React.SetStateAction<boolean>>;
+    syncSteps: ProtectionSyncStep[];
+    setSyncSteps: React.Dispatch<React.SetStateAction<ProtectionSyncStep[]>>;
+    syncStatusText: string;
+    setSyncStatusText: React.Dispatch<React.SetStateAction<string>>;
+    isRollingOut: boolean;
+    setIsRollingOut: React.Dispatch<React.SetStateAction<boolean>>;
+    isRetrying: boolean;
+    setIsRetrying: React.Dispatch<React.SetStateAction<boolean>>;
+    drawerId: 'memory' | 'ransomware';
+    formName: string;
+    setFormName: React.Dispatch<React.SetStateAction<string>>;
+    formContent: string;
+    setFormContent: React.Dispatch<React.SetStateAction<string>>;
+    formSeverity: string;
+    setFormSeverity: React.Dispatch<React.SetStateAction<string>>;
+    formTags: string;
+    setFormTags: React.Dispatch<React.SetStateAction<string>>;
+    refreshRollout: (input?: { pageIndex?: number; pageSize?: number }) => Promise<void>;
+  }) => {
+    const currentPage = Math.min(input.rolloutPageIndex, Math.max(0, input.rolloutTotalPages - 1));
+    const latestSyncStep = input.syncSteps.length > 0 ? input.syncSteps[input.syncSteps.length - 1] : null;
 
     return (
       <>
-        <EuiTitle size="s"><h3>Bundle Status &amp; Rollout</h3></EuiTitle>
-        <EuiSpacer size="m" />
-        <EuiFlexGroup wrap>
-          {[
-            { label: 'Bundle Version', value: String(bundleMetadata.bundle_version) },
-            { label: 'Generated', value: new Date(bundleMetadata.generated_at).toLocaleString() },
-            { label: 'Total Rules', value: String(bundleMetadata.rule_count) },
-            { label: 'Enabled Rules', value: String(bundleMetadata.enabled_rule_count) },
-          ].map(({ label, value }) => (
-            <EuiFlexItem key={label} style={{ minWidth: 160 }}>
-              <EuiPanel color="subdued" paddingSize="s">
-                <EuiText size="xs" color="subdued"><p>{label}</p></EuiText>
-                <EuiText size="m"><p><strong>{value}</strong></p></EuiText>
-              </EuiPanel>
-            </EuiFlexItem>
-          ))}
-        </EuiFlexGroup>
-        <EuiSpacer size="m" />
         <EuiPanel>
-          <EuiText size="s"><p><strong>Policy ID:</strong> {bundleMetadata.policy_id}</p></EuiText>
-          <EuiText size="s"><p><strong>Active Checksums:</strong> {bundleMetadata.active_checksums.length} rules signed</p></EuiText>
-          {bundleMetadata.activated_at && (
-            <EuiText size="s"><p><strong>Activated:</strong> {new Date(bundleMetadata.activated_at).toLocaleString()}</p></EuiText>
+          <EuiFlexGroup justifyContent="spaceBetween" alignItems="flexStart" wrap>
+            <EuiFlexItem grow={false}>
+              <EuiTitle size="s"><h3>{input.title} Registry</h3></EuiTitle>
+              <EuiSpacer size="xs" />
+              <EuiText size="s" color="subdued"><p>{input.description}</p></EuiText>
+              <EuiSpacer size="s" />
+              <EuiBadge color="hollow">index-backed registry content</EuiBadge>
+            </EuiFlexItem>
+            <EuiFlexItem grow={false}>
+              <EuiFlexGroup gutterSize="s" alignItems="center" wrap>
+                <EuiFlexItem grow={false}>
+                  <EuiButton
+                    fill
+                    isLoading={input.isSyncing}
+                    isDisabled={input.isSyncing}
+                    onClick={async () => {
+                      input.setIsSyncing(true);
+                      setBanner(null);
+                      const localStart = new Date().toISOString();
+                      input.setSyncStatusText('Queueing sync job...');
+                      input.setSyncSteps([
+                        {
+                          stage: 'client_queue',
+                          message: `Queueing ${input.title} sync job...`,
+                          at: localStart
+                        }
+                      ]);
+                      try {
+                        const startResult = (await http.post(`/api/xdr-defense/${input.namespace}/open-source/sync/jobs`, {
+                          body: JSON.stringify({}),
+                        })) as ProtectionSyncJobStartResponse;
+
+                        const pollIntervalMs = 900;
+                        let jobState = startResult.job;
+                        input.setSyncSteps(Array.isArray(jobState.steps) ? jobState.steps : []);
+                        input.setSyncStatusText(startResult.already_running ? 'Sync already running; attaching to existing job.' : 'Sync started.');
+
+                        while (jobState.status === 'running') {
+                          await new Promise((resolve) => window.setTimeout(resolve, pollIntervalMs));
+                          jobState = (await http.get(
+                            `/api/xdr-defense/${input.namespace}/open-source/sync/jobs/${encodeURIComponent(jobState.job_id)}`
+                          )) as ProtectionSyncJobStatus;
+                          input.setSyncSteps(Array.isArray(jobState.steps) ? jobState.steps : []);
+                          const latest = Array.isArray(jobState.steps) && jobState.steps.length > 0
+                            ? jobState.steps[jobState.steps.length - 1]
+                            : null;
+                          if (latest?.message) {
+                            input.setSyncStatusText(latest.message);
+                          }
+                        }
+
+                        if (jobState.status === 'failed') {
+                          throw new Error(jobState.error ?? `Failed to sync ${input.title.toLowerCase()} sources.`);
+                        }
+
+                        const result = jobState.result;
+                        if (!result) {
+                          throw new Error('Sync completed without a result payload.');
+                        }
+
+                        input.setSyncSteps(Array.isArray(jobState.steps) ? jobState.steps : result.steps ?? []);
+                        input.setSyncStatusText('Sync completed.');
+
+                        notifications.toasts.addSuccess(`${input.title} sync completed.`);
+                        const candidateText = typeof result.upstream_candidate_rules === 'number'
+                          ? ` Candidate pool ${result.upstream_candidate_rules}.`
+                          : '';
+                        const sourceBreakdownText = Array.isArray(result.source_breakdown) && result.source_breakdown.length > 0
+                          ? ` Sources: ${result.source_breakdown
+                              .map((source) => `${source.source} imported ${source.imported}, unchanged ${source.unchanged}, attempted ${source.attempted}`)
+                              .join(' | ')}.`
+                          : '';
+                        setBanner({
+                          kind: 'success',
+                          message: `${input.title} sync completed. Source ${result.source_name}. Upstream total ${result.upstream_total_rules}.${candidateText} Curated ${result.curated_rules}. Attempted ${result.attempted}, imported ${result.imported}, unchanged ${result.unchanged}. Stored in ${result.index_name}.${sourceBreakdownText}`,
+                        });
+                      } catch (err: unknown) {
+                        input.setSyncStatusText(`Sync failed: ${String((err as Error)?.message ?? err)}`);
+                        setBanner({ kind: 'error', message: `Failed to sync ${input.title.toLowerCase()} feed: ${String((err as Error)?.message ?? err)}` });
+                      } finally {
+                        input.setIsSyncing(false);
+                      }
+                    }}
+                  >
+                    {input.syncButtonLabel}
+                  </EuiButton>
+                </EuiFlexItem>
+                <EuiFlexItem grow={false}>
+                  <EuiButton onClick={() => setDrawerOpen(input.drawerId)}>Add Custom Content</EuiButton>
+                </EuiFlexItem>
+                <EuiFlexItem grow={false}>
+                  <EuiButton
+                    isLoading={input.isRollingOut}
+                    isDisabled={input.isRollingOut}
+                    onClick={async () => {
+                      input.setIsRollingOut(true);
+                      setBanner(null);
+                      try {
+                        const result = (await http.post(`/api/xdr-defense/${input.namespace}/rollout`, {
+                          body: JSON.stringify({ policy_id: 'global-default' }),
+                        })) as { bundle_version?: number; rule_count?: number; message?: string };
+                        await input.refreshRollout();
+                        setBanner({
+                          kind: 'success',
+                          message: `${result.message ?? `${input.title} rollout triggered.`} Bundle version ${result.bundle_version ?? 'n/a'}, rules ${result.rule_count ?? 0}.`,
+                        });
+                      } catch (err: unknown) {
+                        setBanner({ kind: 'error', message: `Failed to roll out ${input.title.toLowerCase()} to all agents: ${String((err as Error)?.message ?? err)}` });
+                      } finally {
+                        input.setIsRollingOut(false);
+                      }
+                    }}
+                  >
+                    Rollout to All Agents
+                  </EuiButton>
+                </EuiFlexItem>
+                <EuiFlexItem grow={false}>
+                  <EuiButton
+                    isLoading={input.isRetrying}
+                    isDisabled={input.isRetrying}
+                    onClick={async () => {
+                      input.setIsRetrying(true);
+                      setBanner(null);
+                      try {
+                        const result = (await http.post(`/api/xdr-defense/${input.namespace}/rollouts/retry`, {
+                          body: JSON.stringify({}),
+                        })) as { message?: string; bundle_version?: number; rule_count?: number };
+                        await input.refreshRollout();
+                        setBanner({
+                          kind: 'success',
+                          message: `${result.message ?? `${input.title} rollout retry requested.`} Bundle version ${result.bundle_version ?? 'n/a'}, rules ${result.rule_count ?? 0}.`,
+                        });
+                      } catch (err: unknown) {
+                        setBanner({ kind: 'error', message: `Failed to retry ${input.title.toLowerCase()} rollout: ${String((err as Error)?.message ?? err)}` });
+                      } finally {
+                        input.setIsRetrying(false);
+                      }
+                    }}
+                  >
+                    Retry Rollout
+                  </EuiButton>
+                </EuiFlexItem>
+              </EuiFlexGroup>
+            </EuiFlexItem>
+          </EuiFlexGroup>
+        </EuiPanel>
+
+        <EuiSpacer size="m" />
+
+        <EuiPanel color="subdued" paddingSize="s">
+          <EuiFlexGroup gutterSize="s" alignItems="center" justifyContent="spaceBetween" wrap>
+            <EuiFlexItem grow={false}>
+              <EuiBadge color={input.isSyncing ? 'warning' : 'hollow'}>
+                sync {input.isSyncing ? 'in progress' : 'idle'}
+              </EuiBadge>
+            </EuiFlexItem>
+            <EuiFlexItem grow={true}>
+              <EuiText size="xs" color="subdued">
+                <p>{latestSyncStep?.message ?? input.syncStatusText}</p>
+              </EuiText>
+            </EuiFlexItem>
+          </EuiFlexGroup>
+          {input.syncSteps.length > 0 && (
+            <>
+              <EuiSpacer size="xs" />
+              <EuiText size="xs" color="subdued">
+                <p>
+                  {input.syncSteps
+                    .slice(-6)
+                    .map((step) => `${new Date(step.at).toLocaleTimeString()} - ${step.message}`)
+                    .join(' | ')}
+                </p>
+              </EuiText>
+            </>
           )}
         </EuiPanel>
+
         <EuiSpacer size="m" />
-        <EuiFlexGroup gutterSize="s">
-          <EuiFlexItem grow={false}>
-            <EuiButton
-              fill
-              onClick={async () => {
-                setBanner(null);
-                try {
-                  const response = (await http.post('/api/xdr-defense/yara/bundle/build', {
-                    body: JSON.stringify({ policy_id: 'global-default' }),
-                  })) as SignedBundle | { bundle?: SignedBundle };
-                  const bundle = (response as { bundle?: SignedBundle }).bundle ?? (response as SignedBundle);
-                  setBanner({ kind: 'success', message: `Bundle rebuilt and signed: version ${bundle.bundle_version}` });
-                  await refreshBundleMetadata();
-                } catch (err: unknown) {
-                  setBanner({ kind: 'error', message: `Failed to build bundle: ${String((err as Error)?.message ?? err)}` });
-                }
-              }}
-            >
-              Rebuild Bundle
-            </EuiButton>
-          </EuiFlexItem>
-          <EuiFlexItem grow={false}>
-            <EuiButton
-              onClick={async () => {
-                setBanner(null);
-                try {
-                  const result = (await http.get('/api/xdr-defense/yara/bundle?policy_id=global-default')) as SignedBundle;
-                  const manifest = {
-                    manifest_version: result.manifest_version,
-                    policy_id: result.policy_id,
-                    bundle_version: result.bundle_version,
-                    generated_at: result.generated_at,
-                    signing_alg: result.signing_alg,
-                    rule_count: result.rules.length,
-                    active_checksums: result.active_checksums,
-                  };
-                  setBanner({ kind: 'success', message: `Bundle manifest:\n${JSON.stringify(manifest, null, 2)}` });
-                } catch (err: unknown) {
-                  setBanner({ kind: 'error', message: `Failed to view bundle: ${String((err as Error)?.message ?? err)}` });
-                }
-              }}
-            >
-              View Manifest
-            </EuiButton>
-          </EuiFlexItem>
-        </EuiFlexGroup>
+
+        <EuiPanel>
+          <EuiTitle size="s"><h3>{input.title} Rollout Status</h3></EuiTitle>
+          <EuiSpacer size="s" />
+          <EuiText size="s" color="subdued">
+            <p>Agents without recent reports are marked offline/unknown (stale after {input.staleAfterMinutes} minutes).</p>
+          </EuiText>
+          <EuiSpacer size="m" />
+          <div style={{ overflowX: 'auto', overflowY: 'auto', maxHeight: '55vh' }}>
+            <div style={{ display: 'inline-block', minWidth: 1200 }}>
+              <EuiInMemoryTable
+                itemId={(row: ProtectionRolloutRow) => `${row.agent}-${row.policy}`}
+                items={input.rolloutRows}
+                columns={protectionRolloutColumns as any}
+                loading={isLoading}
+                pagination={false}
+                sorting={false}
+              />
+            </div>
+          </div>
+          <EuiSpacer size="s" />
+          <EuiFlexGroup alignItems="center" justifyContent="spaceBetween" responsive={false}>
+            <EuiFlexItem grow={false}>
+              <EuiFlexGroup alignItems="center" gutterSize="s" responsive={false}>
+                <EuiFlexItem grow={false}><EuiText size="s"><span>Rows per page</span></EuiText></EuiFlexItem>
+                <EuiFlexItem grow={false}>
+                  <EuiSelect
+                    compressed
+                    value={String(input.rolloutPageSize)}
+                    onChange={(e) => {
+                      input.setRolloutPageSize(Number(e.target.value));
+                      input.setRolloutPageIndex(0);
+                    }}
+                    options={pageSizeOptions.map((o) => ({ value: String(o.value), text: o.text }))}
+                  />
+                </EuiFlexItem>
+                <EuiFlexItem grow={false}><EuiText size="s" color="subdued"><span>{input.rolloutTotal} agent entries</span></EuiText></EuiFlexItem>
+              </EuiFlexGroup>
+            </EuiFlexItem>
+            <EuiFlexItem grow={false}>
+              <EuiPagination
+                pageCount={input.rolloutTotalPages}
+                activePage={currentPage}
+                onPageClick={input.setRolloutPageIndex}
+              />
+            </EuiFlexItem>
+          </EuiFlexGroup>
+        </EuiPanel>
+
+        {drawerOpen === input.drawerId && (
+          <EuiFlyout onClose={() => setDrawerOpen('none')} size="s" ownFocus>
+            <EuiFlyoutHeader hasBorder>
+              <EuiTitle size="m"><h2>Add Custom {input.title} Rule</h2></EuiTitle>
+            </EuiFlyoutHeader>
+            <EuiFlyoutBody>
+              <EuiFlexGroup>
+                <EuiFlexItem>
+                  <EuiFormRow label="Name">
+                    <EuiFieldText value={input.formName} onChange={(e) => input.setFormName(e.target.value)} placeholder="rule name" />
+                  </EuiFormRow>
+                </EuiFlexItem>
+                <EuiFlexItem grow={false} style={{ width: 180 }}>
+                  <EuiFormRow label="Severity">
+                    <EuiSelect options={severityOptions} value={input.formSeverity} onChange={(e) => input.setFormSeverity(e.target.value)} />
+                  </EuiFormRow>
+                </EuiFlexItem>
+              </EuiFlexGroup>
+              <EuiSpacer size="m" />
+              <EuiFormRow label="Tags (comma-separated)">
+                <EuiFieldText value={input.formTags} onChange={(e) => input.setFormTags(e.target.value)} placeholder="memory, custom" />
+              </EuiFormRow>
+              <EuiSpacer size="m" />
+              <EuiFormRow label="Rule Content">
+                <EuiTextArea
+                  value={input.formContent}
+                  onChange={(e) => input.setFormContent(e.target.value)}
+                  placeholder="Structured detection or policy content"
+                  style={{ fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', minHeight: 120 }}
+                />
+              </EuiFormRow>
+            </EuiFlyoutBody>
+            <EuiFlyoutFooter>
+              <EuiFlexGroup justifyContent="spaceBetween">
+                <EuiFlexItem grow={false}><EuiButtonEmpty onClick={() => setDrawerOpen('none')}>Cancel</EuiButtonEmpty></EuiFlexItem>
+                <EuiFlexItem grow={false}>
+                  <EuiButton
+                    fill
+                    onClick={async () => {
+                      setBanner(null);
+                      try {
+                        await http.post(`/api/xdr-defense/${input.namespace}/rules`, {
+                          body: JSON.stringify({
+                            name: input.formName,
+                            content: input.formContent,
+                            severity: input.formSeverity,
+                            tags: input.formTags.split(',').map((t) => t.trim()).filter((t) => t.length > 0),
+                          }),
+                        });
+                        input.setFormName('');
+                        input.setFormContent('');
+                        input.setFormSeverity('medium');
+                        input.setFormTags('');
+                        setDrawerOpen('none');
+                        setBanner({ kind: 'success', message: `Custom ${input.title.toLowerCase()} rule added to the registry index.` });
+                      } catch (err: unknown) {
+                        setBanner({ kind: 'error', message: `Failed to add ${input.title.toLowerCase()} rule: ${String((err as Error)?.message ?? err)}` });
+                      }
+                    }}
+                  >
+                    Add Rule
+                  </EuiButton>
+                </EuiFlexItem>
+              </EuiFlexGroup>
+            </EuiFlyoutFooter>
+          </EuiFlyout>
+        )}
       </>
     );
   };
 
-  const renderTestingTab = () => (
-    <>
-      <EuiTitle size="s"><h3>YARA Testing</h3></EuiTitle>
-      <EuiSpacer size="m" />
-      <EuiFlexGroup alignItems="flexStart">
-        <EuiFlexItem>
-          <EuiFormRow label="Sample Text (optional)">
-            <EuiFieldText
-              value={testSampleText}
-              onChange={(e) => setTestSampleText(e.target.value)}
-              placeholder="string to match in recent docs"
-            />
-          </EuiFormRow>
-        </EuiFlexItem>
-        <EuiFlexItem grow={false} style={{ width: 180 }}>
-          <EuiFormRow label="Lookback Minutes">
-            <EuiFieldText
-              type="number"
-              value={testLookback}
-              onChange={(e) => setTestLookback(e.target.value)}
-              min="1"
-              max="10080"
-            />
-          </EuiFormRow>
-        </EuiFlexItem>
-      </EuiFlexGroup>
-      <EuiSpacer size="m" />
-      <EuiFormRow label="Rule Content">
-        <EuiTextArea
-          value={testContent}
-          onChange={(e) => setTestContent(e.target.value)}
-          placeholder="rule test_rule { ... }"
-          style={{ fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace', minHeight: 120 }}
-        />
-      </EuiFormRow>
-      <EuiSpacer size="m" />
-      <EuiButton
-        fill
-        onClick={async () => {
-          setBanner(null);
-          try {
-            const result = (await http.post('/api/xdr-defense/yara/test', {
-              body: JSON.stringify({
-                content: testContent,
-                sample_text: testSampleText,
-                lookback_minutes: Number(testLookback || '60'),
-              }),
-            })) as YaraTestResponse;
-            setTestOutput(JSON.stringify(result, null, 2));
-          } catch (err: unknown) {
-            setTestOutput(`Test failed: ${String((err as Error)?.message ?? err)}`);
-          }
-        }}
-      >
-        Run Test
-      </EuiButton>
-      <EuiSpacer size="m" />
-      <EuiCodeBlock language="json" isCopyable paddingSize="m">
-        {testOutput}
-      </EuiCodeBlock>
-    </>
-  );
+  const renderMemoryTab = () => renderProtectionTab({
+    namespace: 'memory',
+    title: 'Memory Protection',
+    syncButtonLabel: 'Sync Capa feed',
+    description: 'Manage memory-protection content sourced from curated capa mappings and custom index-backed entries.',
+    rolloutRows: memoryRolloutRows,
+    rolloutTotal: memoryRolloutTotal,
+    rolloutTotalPages: memoryRolloutTotalPages,
+    staleAfterMinutes: memoryRolloutStaleAfterMinutes,
+    rolloutPageIndex: memoryRolloutPageIndex,
+    setRolloutPageIndex: setMemoryRolloutPageIndex,
+    rolloutPageSize: memoryRolloutPageSize,
+    setRolloutPageSize: setMemoryRolloutPageSize,
+    isSyncing: isSyncingMemorySource,
+    setIsSyncing: setIsSyncingMemorySource,
+    syncSteps: memorySyncSteps,
+    setSyncSteps: setMemorySyncSteps,
+    syncStatusText: memorySyncStatusText,
+    setSyncStatusText: setMemorySyncStatusText,
+    isRollingOut: isRollingOutMemory,
+    setIsRollingOut: setIsRollingOutMemory,
+    isRetrying: isRetryingMemoryRollout,
+    setIsRetrying: setIsRetryingMemoryRollout,
+    drawerId: 'memory',
+    formName: memoryFormName,
+    setFormName: setMemoryFormName,
+    formContent: memoryFormContent,
+    setFormContent: setMemoryFormContent,
+    formSeverity: memoryFormSeverity,
+    setFormSeverity: setMemoryFormSeverity,
+    formTags: memoryFormTags,
+    setFormTags: setMemoryFormTags,
+    refreshRollout: refreshMemoryRolloutStatus,
+  });
 
-  const renderCorrelationTab = () => (
-    <EuiPanel>
-      <EuiTitle size="s"><h3>Correlation UX</h3></EuiTitle>
-      <EuiSpacer size="s" />
-      <EuiText>
-        <p><strong>Status:</strong> agent handles single-event detections; OpenSearch handles time-window correlation.</p>
-      </EuiText>
-      <EuiSpacer size="s" />
-      <EuiText>
-        <p><strong>Guidance:</strong> keep signatures deterministic and aggregate suspicious patterns in OpenSearch correlation rules by host, process ancestry, and user context.</p>
-      </EuiText>
-      <EuiSpacer size="s" />
-      <EuiText color="subdued" size="s"><p>No heavy backend work is wired for this tab yet.</p></EuiText>
-    </EuiPanel>
-  );
+  const renderRansomwareTab = () => renderProtectionTab({
+    namespace: 'ransomware',
+    title: 'Ransomware',
+    syncButtonLabel: 'Sync FalcoSecurity + Aqua Security',
+    description: 'Manage ransomware protection content sourced from curated FalcoSecurity and Aqua Security (Tracee) mappings plus custom index-backed entries.',
+    rolloutRows: ransomwareRolloutRows,
+    rolloutTotal: ransomwareRolloutTotal,
+    rolloutTotalPages: ransomwareRolloutTotalPages,
+    staleAfterMinutes: ransomwareRolloutStaleAfterMinutes,
+    rolloutPageIndex: ransomwareRolloutPageIndex,
+    setRolloutPageIndex: setRansomwareRolloutPageIndex,
+    rolloutPageSize: ransomwareRolloutPageSize,
+    setRolloutPageSize: setRansomwareRolloutPageSize,
+    isSyncing: isSyncingRansomwareSource,
+    setIsSyncing: setIsSyncingRansomwareSource,
+    syncSteps: ransomwareSyncSteps,
+    setSyncSteps: setRansomwareSyncSteps,
+    syncStatusText: ransomwareSyncStatusText,
+    setSyncStatusText: setRansomwareSyncStatusText,
+    isRollingOut: isRollingOutRansomware,
+    setIsRollingOut: setIsRollingOutRansomware,
+    isRetrying: isRetryingRansomwareRollout,
+    setIsRetrying: setIsRetryingRansomwareRollout,
+    drawerId: 'ransomware',
+    formName: ransomwareFormName,
+    setFormName: setRansomwareFormName,
+    formContent: ransomwareFormContent,
+    setFormContent: setRansomwareFormContent,
+    formSeverity: ransomwareFormSeverity,
+    setFormSeverity: setRansomwareFormSeverity,
+    formTags: ransomwareFormTags,
+    setFormTags: setRansomwareFormTags,
+    refreshRollout: refreshRansomwareRolloutStatus,
+  });
 
   // ---------------------------------------------------------------------------
   // Render
@@ -2315,10 +2708,9 @@ export const XdrDefenseApp: React.FC<XdrDefenseAppProps> = ({ http, notification
         {[
           { id: 'detection-content', label: 'Yara' },
           { id: 'hashes', label: 'Hashes' },
+          { id: 'memory-protection', label: 'Memory Protection' },
+          { id: 'ransomware-protection', label: 'Ransomware' },
           { id: 'behavioral-rules', label: 'Behavioral Rules' },
-          { id: 'bundle-status', label: 'Bundle Status' },
-          { id: 'testing', label: 'Testing' },
-          { id: 'correlation-ux', label: 'Correlation UX' },
         ].map(({ id, label }) => (
           <EuiTab key={id} isSelected={activeTab === id} onClick={() => setActiveTab(id)}>
             {label}
@@ -2330,10 +2722,9 @@ export const XdrDefenseApp: React.FC<XdrDefenseAppProps> = ({ http, notification
 
       {activeTab === 'detection-content' && renderYaraTab()}
       {activeTab === 'hashes' && renderHashesTab()}
+      {activeTab === 'memory-protection' && renderMemoryTab()}
+      {activeTab === 'ransomware-protection' && renderRansomwareTab()}
       {activeTab === 'behavioral-rules' && renderBehavioralTab()}
-      {activeTab === 'bundle-status' && renderBundleStatusTab()}
-      {activeTab === 'testing' && renderTestingTab()}
-      {activeTab === 'correlation-ux' && renderCorrelationTab()}
     </div>
   );
 };

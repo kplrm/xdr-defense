@@ -133,6 +133,7 @@ Rules for interpretation:
 
 - `rules` remains the transport key across content types so the agent can apply a generic activation path.
 - Hash bundles use line-oriented indicator content rather than YARA text.
+- Hash bundle YAML entries are keyed by `sha256` and may include optional context fields used by agent alerts: `name`, `severity`, `source`, `family`, `mime_type`, and `first_seen_utc`.
 - Behavioral bundles use structured rule content produced from the behavioral store.
 - The hash custom overlay bundle is separate from the full hash bundle and exists for immediate critical custom entries.
 

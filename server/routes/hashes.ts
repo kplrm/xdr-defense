@@ -872,17 +872,45 @@ function buildCustomHashContent(input: { sha256_hash?: string; md5_hash?: string
   return lines.join('\n');
 }
 
-function hashYamlChunkContent(items: Array<{ sha256_hash: string; name: string }>): string {
+interface HashYamlChunkItem {
+  sha256_hash: string;
+  name: string;
+  severity?: string;
+  source?: string;
+  family?: string;
+  mime_type?: string;
+  first_seen_utc?: string;
+}
+
+function yamlScalar(value: string): string {
+  const escaped = value.replace(/'/g, "''");
+  return /[:#\[\]{},|>&*!?'"\\]/.test(value) ? `'${escaped}'` : value;
+}
+
+function hashYamlChunkContent(items: HashYamlChunkItem[]): string {
   if (items.length === 0) {
     return 'hashes: []\n';
   }
 
   const lines: string[] = ['hashes:'];
   for (const item of items) {
-    const escapedName = item.name.replace(/'/g, "''");
-    const safeName = /[:#\[\]{},|>&*!?'"\\]/.test(item.name) ? `'${escapedName}'` : item.name;
     lines.push(`  - sha256: ${item.sha256_hash}`);
-    lines.push(`    name: ${safeName}`);
+    lines.push(`    name: ${yamlScalar(item.name)}`);
+    if (item.severity) {
+      lines.push(`    severity: ${yamlScalar(item.severity)}`);
+    }
+    if (item.source) {
+      lines.push(`    source: ${yamlScalar(item.source)}`);
+    }
+    if (item.family) {
+      lines.push(`    family: ${yamlScalar(item.family)}`);
+    }
+    if (item.mime_type) {
+      lines.push(`    mime_type: ${yamlScalar(item.mime_type)}`);
+    }
+    if (item.first_seen_utc) {
+      lines.push(`    first_seen_utc: ${yamlScalar(item.first_seen_utc)}`);
+    }
   }
 
   return `${lines.join('\n')}\n`;
@@ -919,7 +947,7 @@ async function buildDailyHashBundleSnapshot(client: any): Promise<DailyHashBundl
   const activeChecksums: string[] = [];
 
   let searchAfter: unknown[] | undefined;
-  let chunkRows: Array<{ sha256_hash: string; name: string }> = [];
+  let chunkRows: HashYamlChunkItem[] = [];
   let chunkSeq = 0;
   let totalCriticalHashes = 0;
   const includedCriticalSha256Hashes = new Set<string>();
@@ -972,7 +1000,7 @@ async function buildDailyHashBundleSnapshot(client: any): Promise<DailyHashBundl
             ]
           }
         },
-        _source: ['sha256_hash', 'name'],
+        _source: ['sha256_hash', 'name', 'severity', 'source', 'signature', 'mime_type', 'first_seen_utc'],
         sort: [{ _id: { order: 'asc' } }],
         ...(searchAfter ? { search_after: searchAfter } : {})
       }
@@ -992,7 +1020,12 @@ async function buildDailyHashBundleSnapshot(client: any): Promise<DailyHashBundl
 
       chunkRows.push({
         sha256_hash: sha256,
-        name: String(source.name ?? `Malware SHA256 ${sha256.slice(0, 12)}`)
+        name: String(source.name ?? `Malware SHA256 ${sha256.slice(0, 12)}`),
+        severity: cleanString(source.severity),
+        source: cleanString(source.source),
+        family: cleanString(source.signature),
+        mime_type: cleanString(source.mime_type),
+        first_seen_utc: cleanString(source.first_seen_utc)
       });
       includedCriticalSha256Hashes.add(sha256);
       totalCriticalHashes += 1;
@@ -1091,7 +1124,7 @@ async function buildSignedImmediateCustomHashOverlayBundle(
   );
 
   const staleMutations: Array<{ id: string; doc: null }> = [];
-  const customRowsBySha256 = new Map<string, { sha256_hash: string; name: string }>();
+  const customRowsBySha256 = new Map<string, HashYamlChunkItem>();
 
   for (const entry of docs) {
     if (!isEligibleImmediateCustomHashOverlayDocument(entry.doc)) {
@@ -1112,7 +1145,12 @@ async function buildSignedImmediateCustomHashOverlayBundle(
     if (!customRowsBySha256.has(sha256)) {
       customRowsBySha256.set(sha256, {
         sha256_hash: sha256,
-        name: String(entry.doc.name ?? `Custom SHA256 ${sha256.slice(0, 12)}`)
+        name: String(entry.doc.name ?? `Custom SHA256 ${sha256.slice(0, 12)}`),
+        severity: cleanString(entry.doc.severity),
+        source: cleanString(entry.doc.source),
+        family: cleanString(entry.doc.signature),
+        mime_type: cleanString(entry.doc.mime_type),
+        first_seen_utc: cleanString(entry.doc.first_seen_utc)
       });
     }
   }

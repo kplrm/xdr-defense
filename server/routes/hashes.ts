@@ -876,7 +876,6 @@ interface HashYamlChunkItem {
   sha256_hash: string;
   name: string;
   severity?: string;
-  source?: string;
   family?: string;
   mime_type?: string;
   first_seen_utc?: string;
@@ -898,9 +897,6 @@ function hashYamlChunkContent(items: HashYamlChunkItem[]): string {
     lines.push(`    name: ${yamlScalar(item.name)}`);
     if (item.severity) {
       lines.push(`    severity: ${yamlScalar(item.severity)}`);
-    }
-    if (item.source) {
-      lines.push(`    source: ${yamlScalar(item.source)}`);
     }
     if (item.family) {
       lines.push(`    family: ${yamlScalar(item.family)}`);
@@ -1022,7 +1018,6 @@ async function buildDailyHashBundleSnapshot(client: any): Promise<DailyHashBundl
         sha256_hash: sha256,
         name: String(source.name ?? `Malware SHA256 ${sha256.slice(0, 12)}`),
         severity: cleanString(source.severity),
-        source: cleanString(source.source),
         family: cleanString(source.signature),
         mime_type: cleanString(source.mime_type),
         first_seen_utc: cleanString(source.first_seen_utc)
@@ -1147,7 +1142,6 @@ async function buildSignedImmediateCustomHashOverlayBundle(
         sha256_hash: sha256,
         name: String(entry.doc.name ?? `Custom SHA256 ${sha256.slice(0, 12)}`),
         severity: cleanString(entry.doc.severity),
-        source: cleanString(entry.doc.source),
         family: cleanString(entry.doc.signature),
         mime_type: cleanString(entry.doc.mime_type),
         first_seen_utc: cleanString(entry.doc.first_seen_utc)

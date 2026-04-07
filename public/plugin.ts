@@ -6,6 +6,7 @@ export class XdrDefensePlugin implements Plugin {
     core.application.register({
       id: PLUGIN_ID,
       title: PLUGIN_NAME,
+      order: 2,
       category: PLUGIN_CATEGORY,
       async mount(params: AppMountParameters) {
         const { renderApp } = await import('./application');

@@ -1558,6 +1558,9 @@ export function registerHashRoutes(router: any): void {
   router.get(
     {
       path: '/api/xdr-defense/hashes/custom-overlay/bundle',
+      options: {
+        authRequired: false
+      },
       validate: {
         query: schema.object({
           policy_id: schema.maybe(schema.string({ minLength: 1, maxLength: 256 }))
@@ -1610,6 +1613,9 @@ export function registerHashRoutes(router: any): void {
   router.get(
     {
       path: '/api/xdr-defense/hashes/bundle',
+      options: {
+        authRequired: false
+      },
       validate: {
         query: schema.object({
           policy_id: schema.maybe(schema.string({ minLength: 1, maxLength: 256 }))
@@ -1718,6 +1724,9 @@ export function registerHashRoutes(router: any): void {
   router.post(
     {
       path: '/api/xdr-defense/hashes/rollouts/status/report',
+      options: {
+        authRequired: false
+      },
       validate: {
         body: schema.object({
           agent_id: schema.string({ minLength: 1, maxLength: 256 }),

@@ -149,6 +149,9 @@ export function registerBehavioralRoutes(router: any): void {
   router.get(
     {
       path: '/api/xdr-defense/behavioral/bundle',
+      options: {
+        authRequired: false
+      },
       validate: {
         query: schema.object({
           policy_id: schema.maybe(schema.string({ minLength: 1, maxLength: 256 }))

@@ -247,6 +247,9 @@ function registerProtectionRoutes(router: any, namespace: ProtectionNamespace): 
   router.get(
     {
       path: `${basePath}/bundle`,
+      options: {
+        authRequired: false
+      },
       validate: {
         query: schema.object({
           policy_id: schema.maybe(schema.string({ minLength: 1, maxLength: 256 }))
@@ -569,6 +572,9 @@ function registerProtectionRoutes(router: any, namespace: ProtectionNamespace): 
   router.post(
     {
       path: `${basePath}/rollouts/status/report`,
+      options: {
+        authRequired: false
+      },
       validate: {
         body: schema.object({
           agent_id: schema.string({ minLength: 1, maxLength: 256 }),

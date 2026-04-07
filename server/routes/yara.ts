@@ -653,6 +653,9 @@ export function registerYaraRoutes(router: any): void {
   router.get(
     {
       path: '/api/xdr-defense/yara/bundle',
+      options: {
+        authRequired: false
+      },
       validate: {
         query: schema.object({
           policy_id: schema.maybe(schema.string({ minLength: 1, maxLength: 256 }))
@@ -1079,6 +1082,9 @@ export function registerYaraRoutes(router: any): void {
   router.post(
     {
       path: '/api/xdr-defense/yara/rollouts/status',
+      options: {
+        authRequired: false
+      },
       validate: {
         body: schema.object({
           manager_policy_id: schema.maybe(schema.string({ minLength: 1, maxLength: 256 })),
@@ -1101,6 +1107,9 @@ export function registerYaraRoutes(router: any): void {
   router.post(
     {
       path: '/api/xdr-defense/yara-rollouts/status',
+      options: {
+        authRequired: false
+      },
       validate: rolloutStatusValidationSchema
     },
     async (ctx: any, req: any, res: any) => handleRolloutStatusIngestion(ctx, req, res)
@@ -1128,6 +1137,9 @@ export function registerYaraRoutes(router: any): void {
   router.post(
     {
       path: '/api/xdr-defense/yara/rollouts/ack',
+      options: {
+        authRequired: false
+      },
       validate: ackValidationSchema
     },
     async (ctx: any, req: any, res: any) => handleRolloutAck(ctx, req, res)
@@ -1137,6 +1149,9 @@ export function registerYaraRoutes(router: any): void {
   router.post(
     {
       path: '/api/xdr-defense/yara-rollouts/ack',
+      options: {
+        authRequired: false
+      },
       validate: ackValidationSchema
     },
     async (ctx: any, req: any, res: any) => handleRolloutAck(ctx, req, res)
@@ -1207,6 +1222,9 @@ export function registerYaraRoutes(router: any): void {
   router.post(
     {
       path: '/api/xdr-defense/yara-rules/inventory',
+      options: {
+        authRequired: false
+      },
       validate: inventoryValidationSchema
     },
     async (ctx: any, req: any, res: any) => {

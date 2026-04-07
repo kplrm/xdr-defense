@@ -4,6 +4,9 @@ export function registerSigningRoutes(router: any): void {
   router.get(
     {
       path: '/api/xdr-defense/signing/public-key',
+      options: {
+        authRequired: false
+      },
       validate: false
     },
     async (_ctx: unknown, _req: unknown, res: any) => {

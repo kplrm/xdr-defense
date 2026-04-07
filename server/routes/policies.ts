@@ -18,6 +18,9 @@ export function registerPolicyRoutes(router: any) {
   router.get(
     {
       path: '/api/xdr-defense/policy-overlays/{policyId}',
+      options: {
+        authRequired: false
+      },
       validate: {
         params: schema.object({
           policyId: schema.string({ minLength: 1, maxLength: 256 })
@@ -56,6 +59,9 @@ export function registerPolicyRoutes(router: any) {
   router.post(
     {
       path: '/api/xdr-defense/policy-rollouts/ack',
+      options: {
+        authRequired: false
+      },
       validate: {
         body: schema.object({
           agent_id: schema.string({ minLength: 1, maxLength: 256 }),

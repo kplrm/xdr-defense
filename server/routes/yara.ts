@@ -316,6 +316,16 @@ function scopedOsClient(ctx: any): any | null {
   return null;
 }
 
+function internalOsClient(ctx: any): any | null {
+  if (typeof ctx?.core?.opensearch?.client?.asInternalUser?.search === 'function') {
+    return ctx.core.opensearch.client.asInternalUser;
+  }
+  if (typeof ctx?.opensearch?.client?.asInternalUser?.search === 'function') {
+    return ctx.opensearch.client.asInternalUser;
+  }
+  return scopedOsClient(ctx);
+}
+
 // ACK validation schema (shared between current and legacy routes)
 const ackValidationSchema = {
   body: schema.object({
@@ -664,7 +674,9 @@ export function registerYaraRoutes(router: any): void {
     },
     async (ctx: any, req: any, res: any) => {
       try {
-        const client = scopedOsClient(ctx);
+        // Agent bundle fetches can be unauthenticated or low-privilege.
+        // Use internal client to read plugin-owned YARA index reliably.
+        const client = internalOsClient(ctx);
         if (!client) {
           return res.customError({ statusCode: 503, body: { message: 'OpenSearch scoped client unavailable.' } });
         }
@@ -1286,7 +1298,7 @@ export function registerYaraRoutes(router: any): void {
     },
     async (ctx: any, req: any, res: any) => {
       try {
-        const client = scopedOsClient(ctx);
+        const client = internalOsClient(ctx);
         if (!client) {
           return res.customError({ statusCode: 503, body: { message: 'OpenSearch scoped client unavailable.' } });
         }
@@ -1342,7 +1354,7 @@ export function registerYaraRoutes(router: any): void {
     },
     async (ctx: any, req: any, res: any) => {
       try {
-        const client = scopedOsClient(ctx);
+        const client = internalOsClient(ctx);
         if (!client) {
           return res.customError({ statusCode: 503, body: { message: 'OpenSearch scoped client unavailable.' } });
         }

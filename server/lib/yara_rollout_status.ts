@@ -8,6 +8,11 @@ const AGENT_INDEX = 'xdr-agents';
 const STATUS_STALE_MINUTES = 30;
 const RULE_HEALTH_INDEX_PREFIX = '.xdr-defense-rule-health';
 
+let yaraRolloutStatusIndexReady = false;
+let yaraRolloutStatusIndexEnsureInFlight: Promise<void> | null = null;
+let yaraRolloutRequestIndexReady = false;
+let yaraRolloutRequestIndexEnsureInFlight: Promise<void> | null = null;
+
 export interface YaraRolloutStatusReport {
   manager_policy_id?: string;
   policy_id?: string;
@@ -229,6 +234,43 @@ function mapStoredStatusHit(hit: any): StoredYaraRolloutStatusDoc | null {
   };
 }
 
+function indexExistsResponseToBoolean(response: any): boolean {
+  if (typeof response === 'boolean') {
+    return response;
+  }
+  if (typeof response?.body === 'boolean') {
+    return response.body;
+  }
+  return Number(response?.statusCode ?? response?.status) === 200;
+}
+
+function hasAlreadyExistsType(errorNode: unknown): boolean {
+  if (!errorNode || typeof errorNode !== 'object') {
+    return false;
+  }
+
+  const node = errorNode as Record<string, unknown>;
+  if (String(node.type ?? '').toLowerCase() === 'resource_already_exists_exception') {
+    return true;
+  }
+  if (Array.isArray(node.root_cause) && node.root_cause.some((entry) => hasAlreadyExistsType(entry))) {
+    return true;
+  }
+  return hasAlreadyExistsType(node.caused_by);
+}
+
+function isAlreadyExistsError(err: unknown): boolean {
+  if (hasAlreadyExistsType((err as any)?.body?.error)) {
+    return true;
+  }
+  if (hasAlreadyExistsType((err as any)?.meta?.body?.error)) {
+    return true;
+  }
+
+  const msg = String((err as any)?.message ?? err ?? '').toLowerCase();
+  return msg.includes('resource_already_exists_exception') || msg.includes('already exists');
+}
+
 async function listAgents(client: any): Promise<AgentRecord[]> {
   try {
     const response = await client.search({
@@ -268,51 +310,95 @@ export function yaraRolloutRequestIndexName(): string {
 }
 
 export async function ensureYaraRolloutStatusIndex(client: any): Promise<void> {
-  try {
-    await client.indices.create({
-      index: YARA_ROLLOUT_STATUS_INDEX,
-      body: {
-        mappings: {
-          properties: {
-            agent_id: { type: 'keyword' },
-            agent_hostname: { type: 'keyword' },
-            policy_id: { type: 'keyword' },
-            state: { type: 'keyword' },
-            bundle_version: { type: 'long' },
-            total_rules: { type: 'long' },
-            loaded_rules: { type: 'long' },
-            failed_rule_count: { type: 'long' },
-            last_reported: { type: 'date' },
-            error: { type: 'text' },
-            updated_at: { type: 'date' }
+  if (yaraRolloutStatusIndexReady) {
+    return;
+  }
+
+  if (!yaraRolloutStatusIndexEnsureInFlight) {
+    yaraRolloutStatusIndexEnsureInFlight = (async () => {
+      const existsResponse = await client.indices.exists({ index: YARA_ROLLOUT_STATUS_INDEX });
+      if (indexExistsResponseToBoolean(existsResponse)) {
+        yaraRolloutStatusIndexReady = true;
+        return;
+      }
+
+      try {
+        await client.indices.create({
+          index: YARA_ROLLOUT_STATUS_INDEX,
+          body: {
+            mappings: {
+              properties: {
+                agent_id: { type: 'keyword' },
+                agent_hostname: { type: 'keyword' },
+                policy_id: { type: 'keyword' },
+                state: { type: 'keyword' },
+                bundle_version: { type: 'long' },
+                total_rules: { type: 'long' },
+                loaded_rules: { type: 'long' },
+                failed_rule_count: { type: 'long' },
+                last_reported: { type: 'date' },
+                error: { type: 'text' },
+                updated_at: { type: 'date' }
+              }
+            }
           }
+        });
+      } catch (err: any) {
+        if (!isAlreadyExistsError(err)) {
+          throw err;
         }
       }
+
+      yaraRolloutStatusIndexReady = true;
+    })().finally(() => {
+      yaraRolloutStatusIndexEnsureInFlight = null;
     });
-  } catch (_err) {
-    // index already exists
   }
+
+  return yaraRolloutStatusIndexEnsureInFlight;
 }
 
 export async function ensureYaraRolloutRequestIndex(client: any): Promise<void> {
-  try {
-    await client.indices.create({
-      index: YARA_ROLLOUT_REQUEST_INDEX,
-      body: {
-        mappings: {
-          properties: {
-            policy_id: { type: 'keyword' },
-            bundle_version: { type: 'long' },
-            generated_at: { type: 'date' },
-            requested_at: { type: 'date' },
-            rule_count: { type: 'long' }
+  if (yaraRolloutRequestIndexReady) {
+    return;
+  }
+
+  if (!yaraRolloutRequestIndexEnsureInFlight) {
+    yaraRolloutRequestIndexEnsureInFlight = (async () => {
+      const existsResponse = await client.indices.exists({ index: YARA_ROLLOUT_REQUEST_INDEX });
+      if (indexExistsResponseToBoolean(existsResponse)) {
+        yaraRolloutRequestIndexReady = true;
+        return;
+      }
+
+      try {
+        await client.indices.create({
+          index: YARA_ROLLOUT_REQUEST_INDEX,
+          body: {
+            mappings: {
+              properties: {
+                policy_id: { type: 'keyword' },
+                bundle_version: { type: 'long' },
+                generated_at: { type: 'date' },
+                requested_at: { type: 'date' },
+                rule_count: { type: 'long' }
+              }
+            }
           }
+        });
+      } catch (err: any) {
+        if (!isAlreadyExistsError(err)) {
+          throw err;
         }
       }
+
+      yaraRolloutRequestIndexReady = true;
+    })().finally(() => {
+      yaraRolloutRequestIndexEnsureInFlight = null;
     });
-  } catch (_err) {
-    // index already exists
   }
+
+  return yaraRolloutRequestIndexEnsureInFlight;
 }
 
 export async function ingestYaraRolloutStatusReport(

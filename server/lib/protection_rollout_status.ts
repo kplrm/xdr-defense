@@ -16,6 +16,16 @@ const CONFIG_BY_NAMESPACE: Record<ProtectionNamespace, NamespaceRolloutConfig> =
   ransomware: { statusIndex: 'xdr-defense-ransomware-rollout-status' }
 };
 
+const protectionRolloutStatusIndexReady: Record<ProtectionNamespace, boolean> = {
+  memory: false,
+  ransomware: false
+};
+
+const protectionRolloutStatusEnsureInFlight: Record<ProtectionNamespace, Promise<void> | null> = {
+  memory: null,
+  ransomware: null
+};
+
 export interface ProtectionRolloutStatusReport {
   agent_id: string;
   policy_id?: string;
@@ -177,6 +187,43 @@ function mapStoredStatusHit(hit: any): StoredRolloutStatusDoc | null {
   };
 }
 
+function indexExistsResponseToBoolean(response: any): boolean {
+  if (typeof response === 'boolean') {
+    return response;
+  }
+  if (typeof response?.body === 'boolean') {
+    return response.body;
+  }
+  return Number(response?.statusCode ?? response?.status) === 200;
+}
+
+function hasAlreadyExistsType(errorNode: unknown): boolean {
+  if (!errorNode || typeof errorNode !== 'object') {
+    return false;
+  }
+
+  const node = errorNode as Record<string, unknown>;
+  if (String(node.type ?? '').toLowerCase() === 'resource_already_exists_exception') {
+    return true;
+  }
+  if (Array.isArray(node.root_cause) && node.root_cause.some((entry) => hasAlreadyExistsType(entry))) {
+    return true;
+  }
+  return hasAlreadyExistsType(node.caused_by);
+}
+
+function isAlreadyExistsError(err: unknown): boolean {
+  if (hasAlreadyExistsType((err as any)?.body?.error)) {
+    return true;
+  }
+  if (hasAlreadyExistsType((err as any)?.meta?.body?.error)) {
+    return true;
+  }
+
+  const msg = String((err as any)?.message ?? err ?? '').toLowerCase();
+  return msg.includes('resource_already_exists_exception') || msg.includes('already exists');
+}
+
 async function listAgents(client: any): Promise<AgentRecord[]> {
   try {
     const response = await client.search({
@@ -209,30 +256,55 @@ async function listAgents(client: any): Promise<AgentRecord[]> {
 }
 
 export async function ensureProtectionRolloutStatusIndex(client: any, namespace: ProtectionNamespace): Promise<void> {
+  if (protectionRolloutStatusIndexReady[namespace]) {
+    return;
+  }
+
+  if (protectionRolloutStatusEnsureInFlight[namespace]) {
+    return protectionRolloutStatusEnsureInFlight[namespace] as Promise<void>;
+  }
+
   const nsConfig = config(namespace);
-  try {
-    await client.indices.create({
-      index: nsConfig.statusIndex,
-      body: {
-        mappings: {
-          properties: {
-            agent_id: { type: 'keyword' },
-            agent_hostname: { type: 'keyword' },
-            policy_id: { type: 'keyword' },
-            state: { type: 'keyword' },
-            bundle_version: { type: 'long' },
-            total_rules: { type: 'long' },
-            loaded_rules: { type: 'long' },
-            last_reported: { type: 'date' },
-            error: { type: 'text' },
-            updated_at: { type: 'date' }
+
+  protectionRolloutStatusEnsureInFlight[namespace] = (async () => {
+    const existsResponse = await client.indices.exists({ index: nsConfig.statusIndex });
+    if (indexExistsResponseToBoolean(existsResponse)) {
+      protectionRolloutStatusIndexReady[namespace] = true;
+      return;
+    }
+
+    try {
+      await client.indices.create({
+        index: nsConfig.statusIndex,
+        body: {
+          mappings: {
+            properties: {
+              agent_id: { type: 'keyword' },
+              agent_hostname: { type: 'keyword' },
+              policy_id: { type: 'keyword' },
+              state: { type: 'keyword' },
+              bundle_version: { type: 'long' },
+              total_rules: { type: 'long' },
+              loaded_rules: { type: 'long' },
+              last_reported: { type: 'date' },
+              error: { type: 'text' },
+              updated_at: { type: 'date' }
+            }
           }
         }
+      });
+    } catch (err: any) {
+      if (!isAlreadyExistsError(err)) {
+        throw err;
       }
-    });
-  } catch (_err) {
-    // index likely exists
-  }
+    }
+
+    protectionRolloutStatusIndexReady[namespace] = true;
+  })().finally(() => {
+    protectionRolloutStatusEnsureInFlight[namespace] = null;
+  });
+
+  return protectionRolloutStatusEnsureInFlight[namespace] as Promise<void>;
 }
 
 export async function ingestProtectionRolloutStatusReport(

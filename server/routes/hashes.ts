@@ -28,7 +28,6 @@ import {
   reconcileImmediateCustomHashOverlayState
 } from '../lib/hash_custom_overlay_state';
 import {
-  ensureHashRolloutStatusIndex,
   ingestHashRolloutStatusReport,
   listHashRolloutStatus
 } from '../lib/hash_rollout_status';
@@ -1794,7 +1793,6 @@ export function registerHashRoutes(router: any): void {
           return res.customError({ statusCode: 503, body: { message: 'OpenSearch scoped client unavailable.' } });
         }
 
-        await ensureHashRolloutStatusIndex(client);
         const result = await ingestHashRolloutStatusReport(client, req.body ?? {});
         return res.ok({ body: result });
       } catch (err: any) {
@@ -1826,7 +1824,6 @@ export function registerHashRoutes(router: any): void {
           return res.customError({ statusCode: 503, body: { message: 'OpenSearch scoped client unavailable.' } });
         }
 
-        await ensureHashRolloutStatusIndex(client);
         const result = await listHashRolloutStatus(client, {
           page: req.query?.page,
           pageSize: req.query?.pageSize

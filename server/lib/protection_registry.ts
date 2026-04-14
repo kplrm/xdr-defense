@@ -2,6 +2,7 @@ declare const require: any;
 
 import { readJsonFile, resolvePluginDataPath, writeJsonFile } from './persistent_state';
 import { getSigningPrivateKey } from './signing_keys';
+import { isLinuxRelevantContent } from './platform_relevance';
 
 const crypto = require('crypto');
 const BufferCtor = (globalThis as any).Buffer;
@@ -1428,7 +1429,11 @@ function saveBundleStateFile(namespace: ProtectionNamespace, state: PersistedBun
 
 function buildBundleRuleEntries(records: ProtectionRuleRecord[]): BundleRuleEntry[] {
   return records
-    .filter((record) => record.validation.status === 'valid')
+    .filter(
+      (record) =>
+        record.validation.status === 'valid'
+        && isLinuxRelevantContent(record.name, record.tags, record.content)
+    )
     .map((record) => ({
       id: record.id,
       filename: `${record.id}.yml`,

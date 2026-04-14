@@ -37,6 +37,7 @@ import { getSigningPrivateKey } from '../lib/signing_keys';
 import { getMalwareBazaarSyncState, updateMalwareBazaarSyncState, getMbAutoUpdateSettings, saveMbAutoUpdateSettings } from '../lib/upstream_sync_store';
 import { validateHashContent } from '../lib/hashes_store';
 import { mbAutoUpdateScheduler, callsPerWindow } from '../lib/mb_auto_update';
+import { isLinuxRelevantContent } from '../lib/platform_relevance';
 
 const { schema } = require('@osd/config-schema');
 
@@ -996,7 +997,21 @@ async function buildDailyHashBundleSnapshot(client: any): Promise<DailyHashBundl
             ]
           }
         },
-        _source: ['sha256_hash', 'name', 'severity', 'source', 'signature', 'mime_type', 'first_seen_utc'],
+        _source: [
+          'sha256_hash',
+          'name',
+          'severity',
+          'source',
+          'signature',
+          'mime_type',
+          'first_seen_utc',
+          'file_name',
+          'file_type_guess',
+          'file_format',
+          'file_arch',
+          'tags',
+          'content'
+        ],
         sort: [{ _id: { order: 'asc' } }],
         ...(searchAfter ? { search_after: searchAfter } : {})
       }
@@ -1009,6 +1024,22 @@ async function buildDailyHashBundleSnapshot(client: any): Promise<DailyHashBundl
 
     for (const hit of hits) {
       const source = hit?._source ?? {};
+      if (
+        !isLinuxRelevantContent(
+          source.name,
+          source.signature,
+          source.file_name,
+          source.file_type_guess,
+          source.file_format,
+          source.file_arch,
+          source.mime_type,
+          source.tags,
+          source.content
+        )
+      ) {
+        continue;
+      }
+
       const sha256 = normalizeHash(source.sha256_hash, 64);
       if (!sha256) {
         continue;
@@ -1134,6 +1165,22 @@ async function buildSignedImmediateCustomHashOverlayBundle(
     }
 
     if (fullSnapshotSha256.has(sha256)) {
+      continue;
+    }
+
+    if (
+      !isLinuxRelevantContent(
+        entry.doc.name,
+        entry.doc.signature,
+        entry.doc.file_name,
+        entry.doc.file_type_guess,
+        entry.doc.file_format,
+        entry.doc.file_arch,
+        entry.doc.mime_type,
+        entry.doc.tags,
+        entry.doc.content
+      )
+    ) {
       continue;
     }
 

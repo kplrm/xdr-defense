@@ -5,6 +5,7 @@ const BufferCtor = (globalThis as any).Buffer;
 
 import { readJsonFile, resolvePluginDataPath, writeJsonFile } from './persistent_state';
 import { getSigningPrivateKey } from './signing_keys';
+import { isLinuxRelevantContent } from './platform_relevance';
 
 export const YARA_INDEX_NAME = '.xdr-defense-yara';
 
@@ -770,7 +771,11 @@ export async function deleteCustomYaraRule(client: any, id: string): Promise<{ d
 
 function buildBundleRules(records: YaraRuleRecord[]): BundleRuleEntry[] {
   return records
-    .filter((rule) => rule.validation.status === 'valid')
+    .filter(
+      (rule) =>
+        rule.validation.status === 'valid'
+        && isLinuxRelevantContent(rule.name, rule.tags, rule.content)
+    )
     .map((rule) => ({
       id: rule.id,
       filename: `${rule.id}.yar`,

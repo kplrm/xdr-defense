@@ -20,7 +20,13 @@ const WINDOWS_ONLY_HINTS: RegExp[] = [
   /\\system32\\/i,
   /\\syswow64\\/i,
   /\bpe32\b/i,
-  /\bportable executable\b/i
+  /\bportable executable\b/i,
+  // YARA module imports that target non-Linux binary formats
+  /import\s+"pe"/i,
+  /import\s+"dotnet"/i,
+  /import\s+"macho"/i,
+  // YARA PE module attribute access (pe.is_pe, pe.version_info, pe.DLL, etc.)
+  /\bpe\.[a-z]/i,
 ];
 
 const LINUX_HINTS: RegExp[] = [

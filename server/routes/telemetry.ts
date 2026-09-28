@@ -1,4 +1,5 @@
-import { isIP } from 'net';
+// Dashboards supplies date math at runtime; this external plugin has no local type package.
+const dateMath = require('@elastic/datemath');
 import { schema } from '@osd/config-schema';
 import { TELEMETRY_MODULES, TelemetryBucket, TelemetryModule, TelemetryResponse } from '../../common/telemetry';
 
@@ -12,63 +13,64 @@ function buckets(aggregation: any): TelemetryBucket[] {
   }));
 }
 
-// Escape user wildcards and keep searches inside the selected module and time window.
-function searchFilter(module: TelemetryModule, value: string): any {
-  const escaped = value.replace(/[\\*?]/g, '\\$&');
-  const fields = ['host.hostname', 'event.type'];
-  if (module !== 'network') fields.push(TELEMETRY_MODULES[module].entityField);
-  if (module === 'process') fields.push('payload.process.command_line', 'payload.process.name');
-  if (module === 'network') fields.push('payload.process.name', 'payload.process.executable');
-  const should: any[] = fields.map((field) => ({
-    wildcard: { [field]: { value: `*${escaped}*`, case_insensitive: true } },
-  }));
-  if (isIP(value)) {
-    should.push({ term: { 'payload.source.ip': value } }, { term: { 'payload.destination.ip': value } });
-  }
-  return { bool: { should, minimum_should_match: 1 } };
+function intervalFor(rangeMs: number): string {
+  // Keep roughly 30–50 bars for custom absolute and relative ranges.
+  const intervals: Array<[number, string]> = [
+    [60_000, '1m'], [300_000, '5m'], [900_000, '15m'], [3_600_000, '1h'],
+    [21_600_000, '6h'], [86_400_000, '1d'], [604_800_000, '7d'],
+    [2_592_000_000, '30d'], [31_536_000_000, '365d'],
+  ];
+  return intervals.find(([duration]) => rangeMs / duration <= 50)?.[1] ?? '365d';
 }
 
 export function registerTelemetryRoutes(router: any): void {
-  router.get({
-    path: '/api/xdr-defense/telemetry',
-    validate: { query: schema.object({
+  router.post({
+    path: '/api/xdr-defense/telemetry/search',
+    validate: { body: schema.object({
       module: schema.string({ validate: (value: string) => MODULES.includes(value as TelemetryModule) ? undefined : 'Unknown telemetry module' }),
-      hours: schema.number({ defaultValue: 24, validate: (value: number) => [1, 24, 168].includes(value) ? undefined : 'Use 1, 24 or 168 hours' }),
+      from: schema.string({ minLength: 1, maxLength: 128 }),
+      to: schema.string({ minLength: 1, maxLength: 128 }),
       page: schema.number({ defaultValue: 1, min: 1, max: 400, validate: (value: number) => Number.isInteger(value) ? undefined : 'Expected an integer' }),
-      host: schema.string({ defaultValue: '', maxLength: 256 }),
-      type: schema.string({ defaultValue: '', maxLength: 256 }),
-      search: schema.string({ defaultValue: '', maxLength: 128 }),
+      query: schema.any(),
     }) },
   }, async (ctx: any, req: any, res: any) => {
     const client = ctx?.core?.opensearch?.client?.asCurrentUser;
     if (!client?.search) return res.customError({ statusCode: 503, body: { message: 'OpenSearch client unavailable.' } });
 
-    const { module, hours, page, host, type, search } = req.query;
-    const config = TELEMETRY_MODULES[module as TelemetryModule];
-    const filter: any[] = [
-      { range: { '@timestamp': { gte: `now-${hours}h`, lte: 'now' } } },
-      { terms: { 'event.module': config.modules } },
-    ];
-    if (host) filter.push({ term: { 'host.hostname': host } });
-    if (type) filter.push({ term: { 'event.type': type } });
-    if (search.trim()) filter.push(searchFilter(module, search.trim()));
+    const { module, from, to, page, query: userQuery } = req.body;
+    const start = dateMath.parse(from);
+    const end = dateMath.parse(to, { roundUp: true });
+    if (!start?.isValid() || !end?.isValid() || start.valueOf() >= end.valueOf()) {
+      return res.customError({ statusCode: 400, body: { message: 'Invalid time range.' } });
+    }
+    if (!userQuery || typeof userQuery !== 'object' || Array.isArray(userQuery) ||
+        JSON.stringify(userQuery).length > 32_000 || userQuery.type === 'unsupported') {
+      return res.customError({ statusCode: 400, body: { message: 'Invalid query.' } });
+    }
 
-    const query = { bool: { filter } };
+    const config = TELEMETRY_MODULES[module as TelemetryModule];
+    const startIso = start.toISOString();
+    const endIso = end.toISOString();
+    const query = { bool: { filter: [
+      { range: { '@timestamp': { gte: startIso, lte: endIso } } },
+      { terms: { 'event.module': config.modules } },
+      // Discover compiles KQL and enabled filter pills; the server enforces index, time and module scope.
+      userQuery,
+    ] } };
     const params = { index: INDEX, allow_no_indices: true, ignore_unavailable: true };
     try {
       const [summary, rows] = await Promise.all([
         client.search({ ...params, body: {
           size: 0, query,
           aggs: {
-            timeline: { date_histogram: { field: '@timestamp', fixed_interval: hours === 1 ? '5m' : hours === 24 ? '1h' : '6h', min_doc_count: 0,
-              extended_bounds: { min: `now-${hours}h`, max: 'now' } } },
+            timeline: { date_histogram: { field: '@timestamp', fixed_interval: intervalFor(end.valueOf() - start.valueOf()), min_doc_count: 0,
+              extended_bounds: { min: startIso, max: endIso } } },
             by_type: { terms: { field: 'event.type', size: 12 } },
             by_entity: { terms: { field: config.entityField, size: 8 } },
             by_host: { terms: { field: 'host.hostname', size: 8 } },
             by_facet: { terms: { field: config.facetField, size: 8 } },
             unique_entities: { cardinality: { field: config.entityField } },
             unique_hosts: { cardinality: { field: 'host.hostname' } },
-            // The fourth metric highlights a security-relevant action for each collector.
             highlight: { filter: module === 'dns'
               ? { bool: { filter: [{ exists: { field: 'payload.dns.response_code' } }], must_not: [{ term: { 'payload.dns.response_code': 'NOERROR' } }] } }
               : module === 'network' ? { term: { 'payload.network.direction': 'outbound' } }

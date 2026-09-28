@@ -34,26 +34,26 @@ export interface TelemetryResponse {
 
 export const TELEMETRY_MODULES: Record<TelemetryModule, {
   label: string; modules: string[]; entityField: string; entityLabel: string;
-  facetField: string; facetLabel: string; searchHint: string;
+  facetField: string; facetLabel: string;
 }> = {
   dns: {
     label: 'DNS', modules: ['telemetry.dns'], entityField: 'payload.dns.question.name',
     entityLabel: 'Queried domains', facetField: 'payload.dns.response_code',
-    facetLabel: 'Response codes', searchHint: 'Search domain, host or event type',
+    facetLabel: 'Response codes',
   },
   network: {
     label: 'Network', modules: ['telemetry.network'], entityField: 'payload.destination.ip',
     entityLabel: 'Destination IPs', facetField: 'payload.network.direction',
-    facetLabel: 'Directions', searchHint: 'Search IP, process, host or event type',
+    facetLabel: 'Directions',
   },
   process: {
     label: 'Process', modules: ['telemetry.process'], entityField: 'payload.process.executable',
     entityLabel: 'Executables', facetField: 'payload.process.user.name',
-    facetLabel: 'Users', searchHint: 'Search executable, command, host or event type',
+    facetLabel: 'Users',
   },
   file: {
     label: 'File', modules: ['telemetry.file'], entityField: 'payload.file.path',
     entityLabel: 'File paths', facetField: 'payload.file.directory',
-    facetLabel: 'Directories', searchHint: 'Search path, host or event type',
+    facetLabel: 'Directories',
   },
 };

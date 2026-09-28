@@ -9,7 +9,7 @@ if [[ ! -f "${OSD_SOURCE}/scripts/plugin_helpers.js" ]]; then
   exit 1
 fi
 if [[ -f "${ROOT_DIR}/scripts/test_api.cjs" ]]; then node --test "${ROOT_DIR}/scripts/test_api.cjs"; fi
-if [[ -f "${ROOT_DIR}/scripts/test_inventory.cjs" ]]; then node --test "${ROOT_DIR}/scripts/test_inventory.cjs"; fi
+if [[ -f "${ROOT_DIR}/scripts/test_telemetry.cjs" ]]; then node --test "${ROOT_DIR}/scripts/test_telemetry.cjs"; fi
 if [[ -n "${XDR_BUILD_WORKSPACE:-}" ]]; then
   STAGING="${XDR_BUILD_WORKSPACE}"
   mkdir -p "${STAGING}"

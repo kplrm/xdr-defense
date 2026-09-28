@@ -14,11 +14,9 @@ export class XdrDefensePlugin implements Plugin {
         return renderApp(coreStart, params);
       },
     });
-    return {};
   }
 
   public start(_core: CoreStart) {
-    return {};
   }
 
   public stop() {}

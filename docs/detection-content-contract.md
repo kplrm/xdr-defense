@@ -1,201 +1,81 @@
-# Detection Content Contract
+# Agent release protection inventory contract
 
-This document is the authoritative `xdr-defense` to `xdr-agent` contract for policy overlays, signed content bundles, and rollout state reporting.
+This is the authoritative contract for the rules included in XDR Agent releases and their read-only presentation in XDR Defense.
 
-## Ownership
+## Ownership and lifecycle
 
-`xdr-defense` owns:
+- XDR Agent collects process, file and network telemetry and enforces the Linux YARA Forge Core rules embedded in its release.
+- The agent release build refreshes Forge Core, selects Linux/ELF rules, verifies compilation, and embeds the filtered source and catalog. Windows and other unsupported platform rules are excluded. Ambiguous platform rules are omitted conservatively.
+- XDR Coordinator manages enrollment, agent removal/upgrades, group policies, and heartbeat inventory storage.
+- XDR Defense searches and displays this inventory. It does not author, download, sign, activate, synchronize or roll out detection content.
+- XDR Visualizer reads security alerts and telemetry for investigation.
 
-- global posture mode
-- capability-level policy overlays
-- content curation and signing
-- rollout status storage and operator visibility
+Rules change through a new agent release. The old Defense policy, hash, behavioral, artifact, signing, rollback, rule-write, feed-sync and rollout APIs are removed; this is an intentional break from the legacy content-management contract. Existing stored legacy records are not migrated or deleted automatically. Ransomware, memory protection and behavioral rules are future work.
 
-`xdr-agent` owns:
+## Release catalog
 
-- local verification and activation of signed content
-- endpoint-side scanning and enforcement
-- reporting activation and health state back to the control plane
+The agent generator `tools/bundle_yara.py` produces `internal/detection/malware/bundle/catalog.json` alongside its Linux YARA source. Defense packages that catalog unchanged at `server/data/yara-core-linux.json`. Use `python3 scripts/prepare_catalog.py --agent-root ../xdr-agent` to refresh it from the matching agent checkout before building. The bundle workflow downloads the catalog asset from the latest published agent release.
 
-`xdr-coordinator` may surface rollout commands to agents, but it does not become the source of truth for content state.
+Catalog fields:
 
-## Policy Contract
+| Field | Meaning |
+| --- | --- |
+| `source` | `YARA Forge Core` |
+| `version` | Rule release version recorded by the agent generator |
+| `platform` | `linux` |
+| `rules_sha256` | SHA-256 of the filtered YARA source embedded by the agent |
+| `source_sha256` | SHA-256 of the upstream Forge Core source |
+| `rule_count` | Number of rules in the filtered source/catalog |
+| `rules` | Rule entries with `name`, `tags`, `description`, `author`, `reference`, and complete YARA `content` |
 
-### Canonical routes
-- `GET /api/xdr-defense/policy`
-- `PUT /api/xdr-defense/policy`
-- `GET /api/xdr-defense/policy-overlays/{policyId}`
-- `POST /api/xdr-defense/policy-rollouts/ack`
+The catalog preserves rule metadata and source attribution. It is release data, not an assertion that any endpoint has loaded those rules.
 
-### Overlay response shape
+## Heartbeat inventory
 
-The overlay returned to the agent is centered on:
-
-- `manager_policy_id`
-- `mode`
-- `capabilities`
-- `updatedAt`
-- `version`
-
-Semantics:
-
-- `mode` is `detect` or `prevent`.
-- `capabilities` controls per-feature behavior such as YARA, hashes, behavioral logic, ransomware shield, rollback, and memory-focused paths.
-- `version` is the posture version the agent should acknowledge when applied.
-
-## Content Types
-
-The plugin currently manages three content families:
-
-- YARA
-- hashes
-- behavioral rules
-
-The agent ships without assuming prebuilt runtime content. It should consume what the control plane signs and exposes.
-
-## Canonical Content Routes
-
-### YARA
-- `GET /api/xdr-defense/yara/rules`
-- `POST /api/xdr-defense/yara/rules`
-- `PUT /api/xdr-defense/yara/rules/{id}`
-- `DELETE /api/xdr-defense/yara/rules/{id}`
-- `POST /api/xdr-defense/yara/test`
-- `GET /api/xdr-defense/yara/bundle?policy_id=<id>`
-- `POST /api/xdr-defense/yara/bundle/build`
-- `POST /api/xdr-defense/yara/forge-core/sync`
-- `GET /api/xdr-defense/yara/rollouts/status`
-- `POST /api/xdr-defense/yara/rollouts/status`
-- `POST /api/xdr-defense/yara/rollouts/retry`
-- `POST /api/xdr-defense/yara/rollouts/ack`
-- `POST /api/xdr-defense/yara/rollout`
-
-Compatibility note:
-
-- The legacy aliases under `/api/xdr-defense/yara-rollouts/*` still exist and should remain supported while older agent behavior may still call them.
-
-### Hashes
-- `GET /api/xdr-defense/hashes/rules`
-- `POST /api/xdr-defense/hashes/rules`
-- `PUT /api/xdr-defense/hashes/rules/{id}`
-- `DELETE /api/xdr-defense/hashes/rules/{id}`
-- `GET /api/xdr-defense/hashes/bundle?policy_id=<id>`
-- `POST /api/xdr-defense/hashes/bundle/build`
-- `GET /api/xdr-defense/hashes/custom-overlay/bundle?policy_id=<id>`
-- `GET /api/xdr-defense/hashes/rollouts/status`
-- `POST /api/xdr-defense/hashes/rollouts/status/report`
-- `POST /api/xdr-defense/hashes/rollouts/retry`
-- `POST /api/xdr-defense/hashes/rollout`
-- `POST /api/xdr-defense/hashes/malwarebazaar/sync`
-- `POST /api/xdr-defense/hashes/malwarebazaar/full/sync`
-- `POST /api/xdr-defense/hashes/open-source/sync`
-
-### Behavioral
-- `GET /api/xdr-defense/behavioral/rules`
-- `POST /api/xdr-defense/behavioral/rules`
-- `PUT /api/xdr-defense/behavioral/rules/{id}`
-- `DELETE /api/xdr-defense/behavioral/rules/{id}`
-- `GET /api/xdr-defense/behavioral/bundle?policy_id=<id>`
-- `POST /api/xdr-defense/behavioral/bundle/build`
-- `POST /api/xdr-defense/behavioral/open-source/sync`
-
-## Signed Bundle Shape
-
-The content families use the same operational model even when their internal payloads differ.
-
-Common fields:
+Agent heartbeats optionally include `protection`:
 
 ```json
 {
-  "manifest_version": 1,
-  "policy_id": "global-default",
-  "bundle_version": 12,
-  "generated_at": "2026-03-24T10:00:00.000Z",
-  "signing_alg": "ed25519",
-  "rules": [
-    {
-      "id": "example-rule",
-      "filename": "example-rule.yar",
-      "content": "rule ...",
-      "sha256": "...",
-      "enabled": true,
-      "updatedAt": "2026-03-24T10:00:00.000Z"
-    }
-  ],
-  "active_checksums": ["..."],
-  "signature_base64": "...",
-  "signed_payload_base64": "..."
+  "rule_source": "YARA Forge Core",
+  "rule_version": "<embedded rule version>",
+  "rule_count": 170,
+  "mode": "enforce",
+  "platform": "linux",
+  "rules_sha256": "<64-character SHA-256 of the embedded Linux rules>"
 }
 ```
 
-Rules for interpretation:
+The count above is illustrative; consumers use the actual report. Inventory is meaningful only after the endpoint has initialized its rule engine. Old agents can omit it and are shown as unknown. The coordinator exposes reports through authenticated `GET /api/xdr_manager/protections`:
 
-- `rules` remains the transport key across content types so the agent can apply a generic activation path.
-- Hash bundles use line-oriented indicator content rather than YARA text.
-- Hash bundle YAML entries are keyed by `sha256` and may include optional context fields used by agent alerts: `name`, `severity`, `family`, `mime_type`, and `first_seen_utc`.
-- Behavioral bundles use structured rule content produced from the behavioral store.
-- The hash custom overlay bundle is separate from the full hash bundle and exists for immediate critical custom entries.
+```json
+{
+  "agents": [{
+    "agent_id": "endpoint-id",
+    "name": "hostname",
+    "status": "online",
+    "version": "agent-version",
+    "last_seen": "2026-09-27T12:00:00.000Z",
+    "protection": {}
+  }],
+  "total": 1
+}
+```
 
-## Agent Expectations
+`protection` uses the full heartbeat object above or is absent. Defense displays agent status and last heartbeat; this is last reported state, not live attestation. Rule details are shown for a selected agent only when platform, rules checksum and count match the packaged catalog. If they differ, report metadata remains visible and the UI explains that details for that release are unavailable. Selecting the release catalog explicitly allows browsing independently of installed state.
 
-The agent should:
+## Defense HTTP endpoints
 
-- verify signatures before activation
-- keep the previously verified bundle active if the new one is invalid
-- apply content atomically per content type
-- report rollout status after activation attempts
-- acknowledge posture versions after policy application
+All routes use normal Dashboards authentication; no agent-facing write API remains.
 
-The agent should not:
+| Method and path | Request | Response |
+| --- | --- | --- |
+| `GET /api/xdr-defense/yara/rules` | Optional query `q` (up to 500 characters), `page` (positive integer, default 1), `perPage` (1–100, default 25) | Catalog metadata, filtered `total`, `page`, `perPage`, and rule summaries without `content` |
+| `GET /api/xdr-defense/yara/rules/{name}` | Exact URL-encoded rule name | Complete rule entry; 404 if absent |
 
-- fetch external feeds directly from each host
-- treat unsigned content as authoritative
-- assume every content family is bundled into one endpoint
+Search is case-insensitive across name, description, author, reference and tags. Every whitespace-separated search term must match. An unavailable or malformed packaged catalog returns 503. Invalid request values fail validation.
 
-## Rollout Status Semantics
+## Verification and maintenance
 
-### YARA
-YARA rollout status records center on:
+`npm test` exercises every registered Defense endpoint using the real Dashboards validation schemas, checks searches and pagination, verifies missing-rule handling, rejects write-route registration, and tests checksum matching. `OSD_ROOT` can point tests to a separate Dashboards checkout. Tests run before local and release plugin builds.
 
-- `agent_id`
-- `policy_id`
-- `state`
-- `bundle_version`
-- `total_rules`
-- `loaded_rules`
-- `failed_rules`
-- `reported_at`
-
-Normalized states include:
-
-- `applied`
-- `partial`
-- `failed`
-- `pending`
-- `offline/unknown`
-
-### Hashes
-Hash rollout status records center on:
-
-- `agent_id`
-- `policy_id`
-- `state`
-- `full_bundle_version`
-- `custom_bundle_version`
-- `reported_at`
-- `error`
-
-Hash rollout status metadata does not include rule provenance fields such as `source`.
-
-### Rule inventory
-YARA inventory ingestion is separate from rollout status and is used for operator visibility into loaded and failed rules.
-
-## Correlation Split
-
-- The agent performs single-event detection and enforcement.
-- OpenSearch performs time-window and cross-event correlation.
-- `xdr-defense` may curate behavioral content, but correlation across historical event windows should remain a backend concern.
-
-## Documentation Rule
-
-If new content endpoints or rollout fields are introduced, update this file first and remove or replace any overlapping documentation elsewhere.
+Any endpoint or field change must update this document and the tests together. Agent/coordinator endpoint inventories remain in their respective API contracts; do not recreate content-write APIs here.

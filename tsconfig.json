@@ -8,16 +8,24 @@
     "server/**/*.ts",
     "../OpenSearch-Dashboards/typings/**/*"
   ],
-  "exclude": ["node_modules", "*/node_modules/"],
+  "exclude": [
+    "node_modules",
+    "*/node_modules/"
+  ],
   "compilerOptions": {
     "outDir": "./target",
     "skipLibCheck": true,
     "esModuleInterop": true,
-    "ignoreDeprecations": "6.0",
     "rootDir": "..",
     "typeRoots": [
       "../OpenSearch-Dashboards/node_modules/@types",
       "node_modules/@types"
-    ]
+    ],
+    "baseUrl": ".",
+    "paths": {
+      "@osd/config-schema": [
+        "../OpenSearch-Dashboards/packages/osd-config-schema"
+      ]
+    }
   }
 }

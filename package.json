@@ -2,13 +2,14 @@
   "name": "xdr-defense",
   "version": "0.1.0",
   "private": true,
-  "description": "OpenSearch Dashboards plugin for detection/prevention management",
+  "description": "OpenSearch Dashboards telemetry explorer and release protection inventory",
   "main": "index.js",
   "scripts": {
     "build": "bash ./scripts/build_external.sh",
     "plugin-helpers": "node ../OpenSearch-Dashboards/scripts/plugin_helpers",
     "osd": "node ../OpenSearch-Dashboards/scripts/osd",
-    "lint": "echo lint placeholder"
+    "test": "node --test scripts/test_inventory.cjs",
+    "prepare:catalog": "python3 scripts/prepare_catalog.py"
   },
   "devDependencies": {
     "@swc/helpers": "^0.5.17",

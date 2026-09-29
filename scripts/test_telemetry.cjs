@@ -42,7 +42,7 @@ async function search(body = base, context = {}) {
 
 test('only the documented read-only telemetry search route remains', () => {
   assert.deepEqual([...routes.keys()], [routePath]);
-  const doc = readFileSync(path.join(__dirname, '../docs/telemetry-dashboard.md'), 'utf8');
+  const doc = readFileSync(path.join(__dirname, '../README.md'), 'utf8');
   assert.ok(doc.includes(`POST ${routePath}`));
 });
 

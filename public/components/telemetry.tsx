@@ -1,12 +1,13 @@
 import React, { useEffect, useState } from 'react';
 import {
-  EuiBasicTable, EuiBasicTableColumn, EuiButtonEmpty, EuiCallOut, EuiCodeBlock,
-  EuiFlexGroup, EuiFlexItem, EuiFlyout, EuiFlyoutBody, EuiFlyoutHeader,
-  EuiPanel, EuiProgress, EuiSpacer, EuiStat, EuiTab, EuiTabs, EuiText, EuiTitle,
+  EuiBasicTable, EuiBasicTableColumn, EuiButtonEmpty, EuiButtonIcon, EuiCallOut, EuiCodeBlock,
+  EuiFieldSearch, EuiFlexGroup, EuiFlexItem, EuiFlyout, EuiFlyoutBody, EuiFlyoutHeader,
+  EuiLink, EuiPanel, EuiPopover, EuiProgress, EuiSpacer, EuiStat, EuiTab, EuiTabs, EuiText, EuiTitle,
 } from '@elastic/eui';
 import { CoreStart } from '../../../OpenSearch-Dashboards/src/core/public';
 import { DataPublicPluginStart, DataView } from '../../../OpenSearch-Dashboards/src/plugins/data/public';
 import { TELEMETRY_MODULES, TelemetryBucket, TelemetryEvent, TelemetryModule, TelemetryResponse } from '../../common/telemetry';
+import './telemetry.scss';
 
 type FilterValue = string | number | boolean;
 type AddFilter = (field: string, value: FilterValue) => void;
@@ -19,17 +20,29 @@ const display = (value: unknown): string => value === undefined || value === nul
 const timestamp = (value: string) => value ? new Date(value).toLocaleString() : '—';
 const visible = (value: unknown) => value !== undefined && value !== null && value !== '';
 
-function FilterCell({ values, onFilter, separator = ', ' }: { values: FieldValue[]; onFilter: AddFilter; separator?: string }) {
+function FilterCell({ values, onFilter, separator = ', ', expandable = false }: {
+  values: FieldValue[]; onFilter: AddFilter; separator?: string; expandable?: boolean;
+}) {
+  const [isOpen, setIsOpen] = useState(false);
   const entries = values.filter((item) => visible(item.value));
   if (!entries.length) return <span>—</span>;
-  return <span>{entries.map((item, index) => <React.Fragment key={`${item.field}-${index}`}>
-    {index > 0 && <span>{separator}</span>}
-    <EuiButtonEmpty size="xs" flush="left" title={`Filter: ${item.field} is ${display(item.value)}`}
+  const fullText = entries.map((item) => item.label ?? display(item.value)).join(separator);
+  const links = entries.map((item, index) => <React.Fragment key={`${item.field}-${index}`}>
+    {index > 0 && separator}
+    <EuiLink title={`Filter: ${item.field} is ${display(item.value)}`}
       onClick={() => onFilter(item.field, item.value as FilterValue)}>
-      <span style={{ display: 'inline-block', maxWidth: 280, overflow: 'hidden', textOverflow: 'ellipsis',
-        whiteSpace: 'nowrap', verticalAlign: 'bottom' }}>{item.label ?? display(item.value)}</span>
-    </EuiButtonEmpty>
-  </React.Fragment>)}</span>;
+      {item.label ?? display(item.value)}
+    </EuiLink>
+  </React.Fragment>);
+  if (!expandable) return <span>{links}</span>;
+  return <div className="xdrDefenseCell">
+    <span className="xdrDefenseCell__preview">{links}</span>
+    <EuiPopover isOpen={isOpen} closePopover={() => setIsOpen(false)} anchorPosition="downLeft"
+      button={<EuiButtonIcon className="xdrDefenseCell__expand" size="xs" iconType="popout"
+        aria-label="Show full cell value" title="Show full cell value" onClick={() => setIsOpen(!isOpen)} />}>
+      <div className="xdrDefenseCell__fullValue">{fullText}</div>
+    </EuiPopover>
+  </div>;
 }
 
 function Timeline({ points }: { points: TelemetryResponse['timeline'] }) {
@@ -66,7 +79,7 @@ function Breakdown({ title, field, items, onFilter }: {
 
 function eventColumns(module: TelemetryModule, onFilter: AddFilter, inspect: (event: TelemetryEvent) => void): Array<EuiBasicTableColumn<TelemetryEvent>> {
   const cell = (field: string, value: FieldValue['value'], label?: string) =>
-    <FilterCell values={[{ field, value, label }]} onFilter={onFilter} />;
+    <FilterCell values={[{ field, value, label }]} onFilter={onFilter} expandable />;
   const column = (name: string, render: (source: TelemetryEvent['source']) => React.ReactNode): EuiBasicTableColumn<TelemetryEvent> => ({
     field: 'source', name, render: (source: TelemetryEvent['source']) => render(source),
   });
@@ -85,15 +98,15 @@ function eventColumns(module: TelemetryModule, onFilter: AddFilter, inspect: (ev
         const values: FieldValue[] = Array.isArray(answers) && answers.length
           ? answers.map((answer: any) => ({ field: 'payload.dns.answers.data', value: answer.data }))
           : (s.payload?.dns?.resolved_ips ?? []).map((ip: string) => ({ field: 'payload.dns.resolved_ips', value: ip }));
-        return <FilterCell values={values} onFilter={onFilter} />;
+        return <FilterCell values={values} onFilter={onFilter} expandable />;
       }),
     ],
     network: [
-      column('Source', (s) => <FilterCell onFilter={onFilter} separator="" values={[
+      column('Source', (s) => <FilterCell onFilter={onFilter} separator="" expandable values={[
         { field: 'payload.source.ip', value: s.payload?.source?.ip },
         { field: 'payload.source.port', value: s.payload?.source?.port, label: s.payload?.source?.port === undefined ? '' : `:${s.payload.source.port}` },
       ]} />),
-      column('Destination', (s) => <FilterCell onFilter={onFilter} separator="" values={[
+      column('Destination', (s) => <FilterCell onFilter={onFilter} separator="" expandable values={[
         { field: 'payload.destination.ip', value: s.payload?.destination?.ip },
         { field: 'payload.destination.port', value: s.payload?.destination?.port, label: s.payload?.destination?.port === undefined ? '' : `:${s.payload.destination.port}` },
       ]} />),
@@ -141,18 +154,23 @@ function EventDetails({ event, onClose, onFilter }: {
   event: TelemetryEvent; onClose: () => void; onFilter: AddFilter;
 }) {
   const [view, setView] = useState<'table' | 'json'>('table');
-  const rows = flatten(event.source).slice(0, 300);
+  const [search, setSearch] = useState('');
+  const query = search.trim().toLowerCase();
+  // Search all fields before limiting the visible rows.
+  const matches = flatten(event.source).filter((row) =>
+    !query || row.field.toLowerCase().includes(query) || display(row.value).toLowerCase().includes(query));
+  const rows = matches.slice(0, 300);
   const columns: Array<EuiBasicTableColumn<FieldValue>> = [
     { field: 'field', name: 'Field', render: (field: string) => <code>{field}</code> },
     { field: 'value', name: 'Value', render: (_value: FilterValue, row: FieldValue) =>
-      <FilterCell values={[row]} onFilter={onFilter} /> },
+      <FilterCell values={[row]} onFilter={onFilter} expandable /> },
   ];
   return <EuiFlyout onClose={onClose} size="l" aria-labelledby="telemetry-event-title">
     <EuiFlyoutHeader hasBorder><EuiTitle size="m"><h2 id="telemetry-event-title">{display(event.source['event.type'])}</h2></EuiTitle></EuiFlyoutHeader>
     <EuiFlyoutBody>
-      <EuiText size="s"><p>{timestamp(event.source['@timestamp'])} · {display(event.source['host.hostname'])}<br />
-        Agent: {display(event.source['agent.id'])}<br />Index: {event.index}</p></EuiText>
-      <EuiSpacer />
+      <EuiFieldSearch fullWidth placeholder="Search fields or values" aria-label="Search event fields and values"
+        value={search} onChange={(change) => setSearch(change.target.value)} />
+      <EuiSpacer size="m" />
       <EuiTabs>
         <EuiTab isSelected={view === 'table'} onClick={() => setView('table')}>Table</EuiTab>
         <EuiTab isSelected={view === 'json'} onClick={() => setView('json')}>JSON</EuiTab>
@@ -160,7 +178,8 @@ function EventDetails({ event, onClose, onFilter }: {
       <EuiSpacer size="m" />
       {view === 'table' ? <>
         <EuiBasicTable<FieldValue> items={rows} columns={columns} />
-        {rows.length === 300 && <EuiText size="xs" color="subdued">Showing the first 300 fields. JSON contains the complete event.</EuiText>}
+        {matches.length === 0 && <EuiText size="s" color="subdued">No matching fields or values.</EuiText>}
+        {matches.length > 300 && <EuiText size="xs" color="subdued">Showing the first 300 matching fields. JSON contains the complete event.</EuiText>}
       </> : <EuiCodeBlock language="json" isCopyable fontSize="s">{JSON.stringify(event.source, null, 2)}</EuiCodeBlock>}
     </EuiFlyoutBody>
   </EuiFlyout>;
@@ -230,7 +249,8 @@ export const TelemetryExplorer = ({ http, data: dataPlugin, dataView, module, re
         <EuiText size="xs" color="subdued">{response.total.toLocaleString()} matching events, newest first. Select a value to add a filter, or view the full event.</EuiText>
         <EuiSpacer size="m" />
         {response.total === 0 && <EuiCallOut title="No events in this range" color="primary"><p>Widen the time range or clear filters.</p></EuiCallOut>}
-        <EuiBasicTable<TelemetryEvent> items={response.events} columns={eventColumns(module, onFilter, setSelected)} loading={loading}
+        <EuiBasicTable<TelemetryEvent> className="xdrDefenseEventsTable" tableLayout="fixed"
+          items={response.events} columns={eventColumns(module, onFilter, setSelected)} loading={loading}
           pagination={{ pageIndex: page, pageSize: response.pageSize, totalItemCount: Math.min(response.total, 10000), hidePerPageOptions: true }}
           onChange={({ page: next }: { page?: { index: number } }) => { if (next) setPage(next.index); }} />
         {response.total > 10000 && <EuiText size="xs" color="subdued">Showing the newest 10,000 events. Narrow the filters to inspect older matches.</EuiText>}

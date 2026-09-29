@@ -13,6 +13,7 @@
     "*/node_modules/"
   ],
   "compilerOptions": {
+    "ignoreDeprecations": "6.0",
     "outDir": "./target",
     "skipLibCheck": true,
     "esModuleInterop": true,

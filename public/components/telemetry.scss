@@ -1,0 +1,40 @@
+.xdrDefenseEventsTable {
+  .euiTable, .ouiTable { width: 100%; table-layout: fixed; }
+  .euiTableCellContent, .ouiTableCellContent { min-width: 0; overflow: hidden; }
+}
+
+.xdrDefenseCell {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+
+  &__preview {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  &__expand {
+    opacity: 0;
+    transition: opacity 120ms ease;
+  }
+
+  &:hover &__expand,
+  &:focus-within &__expand {
+    opacity: 1;
+  }
+
+}
+
+// EUI portals the popover panel outside the table cell.
+.xdrDefenseCell__fullValue {
+  max-width: 28rem;
+  max-height: 16rem;
+  overflow: auto;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}

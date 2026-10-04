@@ -6,6 +6,8 @@ export interface TelemetryPoint extends TelemetryBucket { time: string; }
 export interface TelemetryEvent {
   id: string;
   index: string;
+  // Preserve all search-hit metadata alongside the original document.
+  metadata: Record<string, unknown>;
   source: {
     '@timestamp': string;
     'event.type': string;

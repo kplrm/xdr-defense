@@ -85,7 +85,10 @@ export function registerTelemetryRoutes(router: any): void {
       const aggs = summary?.body?.aggregations ?? {};
       const result: TelemetryResponse = {
         total: Number(rows?.body?.hits?.total?.value ?? 0), page, pageSize: PAGE_SIZE,
-        events: (rows?.body?.hits?.hits ?? []).map((hit: any) => ({ id: String(hit._id), index: String(hit._index), source: hit._source })),
+        events: (rows?.body?.hits?.hits ?? []).map((hit: any) => {
+          const { _source, ...metadata } = hit;
+          return { id: String(hit._id), index: String(hit._index), source: _source, metadata };
+        }),
         timeline: (aggs.timeline?.buckets ?? []).map((bucket: any) => ({
           time: String(bucket.key_as_string), key: String(bucket.key_as_string), count: Number(bucket.doc_count ?? 0),
         })),

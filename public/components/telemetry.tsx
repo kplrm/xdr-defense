@@ -15,7 +15,7 @@ interface Props {
   http: CoreStart['http']; data: DataPublicPluginStart; dataView: DataView;
   module: TelemetryModule; revision: number; onFilter: AddFilter;
 }
-interface FieldValue { field: string; value: FilterValue | null | undefined; label?: string; }
+interface FieldValue { field: string; value: FilterValue | null | undefined; label?: string; filterable?: boolean; }
 const display = (value: unknown): string => value === undefined || value === null || value === '' ? '—' : String(value);
 const timestamp = (value: string) => value ? new Date(value).toLocaleString() : '—';
 const visible = (value: unknown) => value !== undefined && value !== null && value !== '';
@@ -140,12 +140,15 @@ function eventColumns(module: TelemetryModule, onFilter: AddFilter, inspect: (ev
 }
 
 function flatten(value: any, prefix = '', rows: FieldValue[] = []): FieldValue[] {
-  if (Array.isArray(value)) {
+  if (value && typeof value === 'object' && Object.keys(value).length === 0) {
+    rows.push({ field: prefix, value: JSON.stringify(value), filterable: false });
+  } else if (Array.isArray(value)) {
     value.forEach((part) => flatten(part, prefix, rows));
   } else if (value && typeof value === 'object') {
     Object.entries(value).forEach(([name, part]) => flatten(part, prefix ? `${prefix}.${name}` : name, rows));
   } else if (prefix) {
-    rows.push({ field: prefix, value });
+    rows.push({ field: prefix, value: value === null || value === '' ? JSON.stringify(value) : value,
+      filterable: value !== null && value !== '' });
   }
   return rows;
 }
@@ -156,14 +159,18 @@ function EventDetails({ event, onClose, onFilter }: {
   const [view, setView] = useState<'table' | 'json'>('table');
   const [search, setSearch] = useState('');
   const query = search.trim().toLowerCase();
-  // Search all fields before limiting the visible rows.
-  const matches = flatten(event.source).filter((row) =>
+  // Metadata is inspectable, but values such as sort and _score are not filters.
+  const metadata = event.metadata ?? { _id: event.id, _index: event.index };
+  const document = { ...metadata, _source: event.source };
+  const metadataRows: FieldValue[] = Object.entries(metadata).map(([field, value]) => ({
+    field, value: typeof value === 'string' ? value : JSON.stringify(value), filterable: false,
+  }));
+  const rows = [...metadataRows, ...flatten(event.source)].filter((row) =>
     !query || row.field.toLowerCase().includes(query) || display(row.value).toLowerCase().includes(query));
-  const rows = matches.slice(0, 300);
   const columns: Array<EuiBasicTableColumn<FieldValue>> = [
     { field: 'field', name: 'Field', render: (field: string) => <code>{field}</code> },
     { field: 'value', name: 'Value', render: (_value: FilterValue, row: FieldValue) =>
-      <FilterCell values={[row]} onFilter={onFilter} expandable /> },
+      row.filterable === false ? <code>{row.value}</code> : <FilterCell values={[row]} onFilter={onFilter} expandable /> },
   ];
   return <EuiFlyout onClose={onClose} size="l" aria-labelledby="telemetry-event-title">
     <EuiFlyoutHeader hasBorder><EuiTitle size="m"><h2 id="telemetry-event-title">{display(event.source['event.type'])}</h2></EuiTitle></EuiFlyoutHeader>
@@ -178,9 +185,8 @@ function EventDetails({ event, onClose, onFilter }: {
       <EuiSpacer size="m" />
       {view === 'table' ? <>
         <EuiBasicTable<FieldValue> items={rows} columns={columns} />
-        {matches.length === 0 && <EuiText size="s" color="subdued">No matching fields or values.</EuiText>}
-        {matches.length > 300 && <EuiText size="xs" color="subdued">Showing the first 300 matching fields. JSON contains the complete event.</EuiText>}
-      </> : <EuiCodeBlock language="json" isCopyable fontSize="s">{JSON.stringify(event.source, null, 2)}</EuiCodeBlock>}
+        {rows.length === 0 && <EuiText size="s" color="subdued">No matching fields or values.</EuiText>}
+      </> : <EuiCodeBlock language="json" isCopyable fontSize="s">{JSON.stringify(document, null, 2)}</EuiCodeBlock>}
     </EuiFlyoutBody>
   </EuiFlyout>;
 }

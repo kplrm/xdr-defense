@@ -1,9 +1,8 @@
 // Dashboards supplies date math at runtime; this external plugin has no local type package.
 const dateMath = require('@elastic/datemath');
 import { schema } from '@osd/config-schema';
-import { TELEMETRY_MODULES, TelemetryBucket, TelemetryModule, TelemetryResponse } from '../../common/telemetry';
+import { TELEMETRY_MODULES, TELEMETRY_STREAM, TelemetryBucket, TelemetryModule, TelemetryResponse } from '../../common/telemetry';
 
-const INDEX = 'xdr-agent-telemetry';
 const PAGE_SIZE = 25;
 const MODULES = Object.keys(TELEMETRY_MODULES) as TelemetryModule[];
 
@@ -57,7 +56,7 @@ export function registerTelemetryRoutes(router: any): void {
       // Discover compiles KQL and enabled filter pills; the server enforces index, time and module scope.
       userQuery,
     ] } };
-    const params = { index: INDEX, allow_no_indices: true, ignore_unavailable: true };
+    const params = { index: TELEMETRY_STREAM, allow_no_indices: true, ignore_unavailable: true };
     try {
       const [summary, rows] = await Promise.all([
         client.search({ ...params, body: {

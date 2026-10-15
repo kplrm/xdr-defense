@@ -6,6 +6,7 @@ XDR Defense is a read-only OpenSearch Dashboards plugin for the `xdr-agent-telem
 
 The time picker, KQL search, and filter pills apply to every tab. Click chart or table values to add filters; open an event to inspect its Table or JSON view. The read API is `POST /api/xdr-defense/telemetry/search`.
 Event details include the full document and returned metadata such as `_index`, `_id`, and `_score`.
+Searches target the stream name across rollover; `_index` in an event identifies its `.ds-*` backing index. For Discover, Coordinator installs a telemetry index pattern and an `xdr-agent-*` pattern for all Agent events in the Global tenant.
 
 ## Install
 

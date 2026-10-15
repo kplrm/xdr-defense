@@ -4,7 +4,7 @@ import { I18nProvider } from '@osd/i18n/react';
 import { EuiCallOut, EuiLoadingSpinner, EuiSpacer, EuiTab, EuiTabs, EuiText, EuiTitle } from '@elastic/eui';
 import { AppMountParameters, CoreStart } from '../../OpenSearch-Dashboards/src/core/public';
 import { DataPublicPluginStart, DataView } from '../../OpenSearch-Dashboards/src/plugins/data/public';
-import { TELEMETRY_MODULES, TelemetryModule } from '../common/telemetry';
+import { TELEMETRY_MODULES, TELEMETRY_STREAM, TelemetryModule } from '../common/telemetry';
 import { TelemetryExplorer } from './components/telemetry';
 
 const modules: TelemetryModule[] = ['dns', 'network', 'process', 'file'];
@@ -18,9 +18,9 @@ const XdrDefenseApp = ({ http, data }: { http: CoreStart['http']; data: DataPubl
   useEffect(() => {
     let active = true;
     // A temporary data view supplies the same KQL fields and filter editor as Discover.
-    data.dataViews.create({ title: 'xdr-agent-telemetry', timeFieldName: '@timestamp' })
+    data.dataViews.create({ title: TELEMETRY_STREAM, timeFieldName: '@timestamp' })
       .then((view) => { if (active) setDataView(view); })
-      .catch(() => { if (active) setViewError('Telemetry fields could not be loaded. Check access to the telemetry indices.'); });
+      .catch(() => { if (active) setViewError('Telemetry fields could not be loaded. Check access to the xdr-agent-telemetry data stream.'); });
     const current = data.query.queryString.getQuery();
     if (current.language !== 'kuery') data.query.queryString.setQuery({ query: '', language: 'kuery' });
     return () => { active = false; };

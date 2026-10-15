@@ -1,3 +1,7 @@
+// Both field discovery and server searches address the stream, including every
+// backing index after rollover. OpenSearch uses the same search API for streams.
+export const TELEMETRY_STREAM = 'xdr-agent-telemetry';
+
 export type TelemetryModule = 'dns' | 'network' | 'process' | 'file';
 
 export interface TelemetryBucket { key: string; count: number; }

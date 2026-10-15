@@ -3,7 +3,7 @@ const dateMath = require('@elastic/datemath');
 import { schema } from '@osd/config-schema';
 import { TELEMETRY_MODULES, TelemetryBucket, TelemetryModule, TelemetryResponse } from '../../common/telemetry';
 
-const INDEX = '.xdr-agent-telemetry-*';
+const INDEX = 'xdr-agent-telemetry,.xdr-agent-telemetry-*';
 const PAGE_SIZE = 25;
 const MODULES = Object.keys(TELEMETRY_MODULES) as TelemetryModule[];
 
@@ -79,7 +79,7 @@ export function registerTelemetryRoutes(router: any): void {
         } }),
         client.search({ ...params, body: {
           size: PAGE_SIZE, from: (page - 1) * PAGE_SIZE, track_total_hits: true, query,
-          sort: [{ '@timestamp': { order: 'desc' } }, { id: { order: 'asc' } }],
+          sort: [{ '@timestamp': { order: 'desc' } }, { id: { order: 'asc', unmapped_type: 'keyword' } }],
         } }),
       ]);
       const aggs = summary?.body?.aggregations ?? {};

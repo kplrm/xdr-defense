@@ -18,7 +18,7 @@ const XdrDefenseApp = ({ http, data }: { http: CoreStart['http']; data: DataPubl
   useEffect(() => {
     let active = true;
     // A temporary data view supplies the same KQL fields and filter editor as Discover.
-    data.dataViews.create({ title: '.xdr-agent-telemetry-*', timeFieldName: '@timestamp' })
+    data.dataViews.create({ title: 'xdr-agent-telemetry,.xdr-agent-telemetry-*', timeFieldName: '@timestamp' })
       .then((view) => { if (active) setDataView(view); })
       .catch(() => { if (active) setViewError('Telemetry fields could not be loaded. Check access to the telemetry indices.'); });
     const current = data.query.queryString.getQuery();

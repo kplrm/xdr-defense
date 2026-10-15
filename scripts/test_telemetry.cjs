@@ -81,7 +81,7 @@ test('time, module and compiled Discover filters scope every search', async () =
   assert.equal(result.body.byType[0].key, 'dns.query');
   assert.equal(calls.length, 2);
   for (const call of calls) {
-    assert.equal(call.index, '.xdr-agent-telemetry-*');
+    assert.equal(call.index, 'xdr-agent-telemetry,.xdr-agent-telemetry-*');
     const filters = call.body.query.bool.filter;
     assert.deepEqual(filters[0], { range: { '@timestamp': { gte: base.from, lte: base.to } } });
     assert.deepEqual(filters[1], { terms: { 'event.module': ['telemetry.dns'] } });
@@ -90,6 +90,7 @@ test('time, module and compiled Discover filters scope every search', async () =
   assert.equal(calls[1].body.from, 25);
   assert.equal(calls[0].body.aggs.by_entity.terms.field, 'payload.dns.question.name');
   assert.equal(calls[1].body.track_total_hits, true);
+  assert.equal(calls[1].body.sort[1].id.unmapped_type, 'keyword');
 });
 
 test('invalid scope and time are rejected; a scoped client is required', async () => {

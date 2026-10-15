@@ -1,6 +1,6 @@
 # XDR Defense
 
-XDR Defense is a read-only OpenSearch Dashboards plugin for XDR Agent telemetry in the `xdr-agent-telemetry` data stream and legacy `.xdr-agent-telemetry-*` indices. DNS, Network, Process, and File tabs show activity, key metrics, breakdowns, and recent events. File includes access and integrity events.
+XDR Defense is a read-only OpenSearch Dashboards plugin for the `xdr-agent-telemetry` data stream. DNS, Network, Process, and File tabs show activity, key metrics, breakdowns, and recent events. File includes access and integrity events.
 
 ![XDR Defense DNS overview with shared search controls, charts, and event table](images/XDR_Defense-overview.png)
 

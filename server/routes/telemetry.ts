@@ -3,7 +3,7 @@ const dateMath = require('@elastic/datemath');
 import { schema } from '@osd/config-schema';
 import { TELEMETRY_MODULES, TelemetryBucket, TelemetryModule, TelemetryResponse } from '../../common/telemetry';
 
-const INDEX = 'xdr-agent-telemetry,.xdr-agent-telemetry-*';
+const INDEX = 'xdr-agent-telemetry';
 const PAGE_SIZE = 25;
 const MODULES = Object.keys(TELEMETRY_MODULES) as TelemetryModule[];
 

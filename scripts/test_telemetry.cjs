@@ -59,7 +59,7 @@ test('time, module and compiled Discover filters scope every search', async () =
       unique_entities: { value: 1 }, unique_hosts: { value: 1 }, highlight: { doc_count: 0 },
     } } };
     return { body: { hits: { total: { value: 2 }, hits: [{
-      _id: 'agent:event', _index: '.xdr-agent-telemetry-2026-09-28',
+      _id: 'agent:event', _index: '.ds-xdr-agent-telemetry-000001',
       _score: null, sort: [1790625600000, 'event'], _ignored: ['payload.large'],
       fields: { 'host.hostname': ['laptop'] },
       _source: { id: 'event', 'event.type': 'dns.query', 'event.module': 'telemetry.dns',
@@ -73,7 +73,7 @@ test('time, module and compiled Discover filters scope every search', async () =
   assert.equal(result.body.events[0].source.payload.dns.question.name, 'example.org');
   // Keep metadata available to both inspection views without altering _source.
   assert.deepEqual(result.body.events[0].metadata, {
-    _id: 'agent:event', _index: '.xdr-agent-telemetry-2026-09-28',
+    _id: 'agent:event', _index: '.ds-xdr-agent-telemetry-000001',
     _score: null, sort: [1790625600000, 'event'], _ignored: ['payload.large'],
     fields: { 'host.hostname': ['laptop'] },
   });
@@ -81,7 +81,7 @@ test('time, module and compiled Discover filters scope every search', async () =
   assert.equal(result.body.byType[0].key, 'dns.query');
   assert.equal(calls.length, 2);
   for (const call of calls) {
-    assert.equal(call.index, 'xdr-agent-telemetry,.xdr-agent-telemetry-*');
+    assert.equal(call.index, 'xdr-agent-telemetry');
     const filters = call.body.query.bool.filter;
     assert.deepEqual(filters[0], { range: { '@timestamp': { gte: base.from, lte: base.to } } });
     assert.deepEqual(filters[1], { terms: { 'event.module': ['telemetry.dns'] } });

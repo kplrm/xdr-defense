@@ -78,7 +78,7 @@ export function registerTelemetryRoutes(router: any): void {
         } }),
         client.search({ ...params, body: {
           size: PAGE_SIZE, from: (page - 1) * PAGE_SIZE, track_total_hits: true, query,
-          sort: [{ '@timestamp': { order: 'desc' } }, { id: { order: 'asc', unmapped_type: 'keyword' } }],
+          sort: [{ '@timestamp': { order: 'desc' } }, { _doc: { order: 'asc' } }],
         } }),
       ]);
       const aggs = summary?.body?.aggregations ?? {};

@@ -60,9 +60,9 @@ test('time, module and compiled Discover filters scope every search', async () =
     } } };
     return { body: { hits: { total: { value: 2 }, hits: [{
       _id: 'agent:event', _index: '.ds-xdr-agent-telemetry-000001',
-      _score: null, sort: [1790625600000, 'event'], _ignored: ['large'],
+      _score: null, sort: [1790625600000, 1], _ignored: ['large'],
       fields: { 'host.hostname': ['laptop'] },
-      _source: { id: 'event', 'event.type': 'dns.query', 'event.module': 'telemetry.dns',
+      _source: { 'event.type': 'dns.query', 'event.module': 'telemetry.dns',
         '@timestamp': base.from, dns: { question: { name: 'example.org' } } },
     }] } } };
   } };
@@ -74,10 +74,12 @@ test('time, module and compiled Discover filters scope every search', async () =
   // Keep metadata available to both inspection views without altering _source.
   assert.deepEqual(result.body.events[0].metadata, {
     _id: 'agent:event', _index: '.ds-xdr-agent-telemetry-000001',
-    _score: null, sort: [1790625600000, 'event'], _ignored: ['large'],
+    _score: null, sort: [1790625600000, 1], _ignored: ['large'],
     fields: { 'host.hostname': ['laptop'] },
   });
-  assert.equal(result.body.events[0].source.id, 'event');
+  assert.equal(result.body.events[0].id, 'agent:event');
+  assert.equal(Object.hasOwn(result.body.events[0].source, 'id'), false);
+  assert.equal(Object.hasOwn(result.body.events[0].source, '_id'), false);
   assert.equal(result.body.byType[0].key, 'dns.query');
   assert.equal(calls.length, 2);
   for (const call of calls) {
@@ -90,7 +92,7 @@ test('time, module and compiled Discover filters scope every search', async () =
   assert.equal(calls[1].body.from, 25);
   assert.equal(calls[0].body.aggs.by_entity.terms.field, 'dns.question.name');
   assert.equal(calls[1].body.track_total_hits, true);
-  assert.equal(calls[1].body.sort[1].id.unmapped_type, 'keyword');
+  assert.deepEqual(calls[1].body.sort, [{ '@timestamp': { order: 'desc' } }, { _doc: { order: 'asc' } }]);
 });
 
 test('invalid scope and time are rejected; a scoped client is required', async () => {

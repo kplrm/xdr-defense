@@ -18,7 +18,6 @@ export interface TelemetryEvent {
     'event.module': string;
     'host.hostname': string;
     'agent.id': string;
-    payload?: Record<string, any>;
     [field: string]: any;
   };
 }
@@ -43,23 +42,23 @@ export const TELEMETRY_MODULES: Record<TelemetryModule, {
   facetField: string; facetLabel: string;
 }> = {
   dns: {
-    label: 'DNS', modules: ['telemetry.dns'], entityField: 'payload.dns.question.name',
-    entityLabel: 'Queried domains', facetField: 'payload.dns.response_code',
+    label: 'DNS', modules: ['telemetry.dns'], entityField: 'dns.question.name',
+    entityLabel: 'Queried domains', facetField: 'dns.response_code',
     facetLabel: 'Response codes',
   },
   network: {
-    label: 'Network', modules: ['telemetry.network'], entityField: 'payload.destination.ip',
-    entityLabel: 'Destination IPs', facetField: 'payload.network.direction',
+    label: 'Network', modules: ['telemetry.network'], entityField: 'remote.ip',
+    entityLabel: 'Remote IPs', facetField: 'network.direction',
     facetLabel: 'Directions',
   },
   process: {
-    label: 'Process', modules: ['telemetry.process'], entityField: 'payload.process.executable',
-    entityLabel: 'Executables', facetField: 'payload.process.user.name',
+    label: 'Process', modules: ['telemetry.process'], entityField: 'process.executable',
+    entityLabel: 'Executables', facetField: 'process.user.name',
     facetLabel: 'Users',
   },
   file: {
-    label: 'File', modules: ['telemetry.file'], entityField: 'payload.file.path',
-    entityLabel: 'File paths', facetField: 'payload.file.directory',
+    label: 'File', modules: ['telemetry.file'], entityField: 'file.path',
+    entityLabel: 'File paths', facetField: 'file.directory',
     facetLabel: 'Directories',
   },
 };

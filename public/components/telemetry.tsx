@@ -90,47 +90,47 @@ function eventColumns(module: TelemetryModule, onFilter: AddFilter, inspect: (ev
   ];
   const specific: Record<TelemetryModule, Array<EuiBasicTableColumn<TelemetryEvent>>> = {
     dns: [
-      column('Question', (s) => cell('payload.dns.question.name', s.payload?.dns?.question?.name)),
-      column('Record', (s) => cell('payload.dns.question.type', s.payload?.dns?.question?.type)),
-      column('Response', (s) => cell('payload.dns.response_code', s.payload?.dns?.response_code)),
+      column('Question', (s) => cell('dns.question.name', s.dns.question?.name)),
+      column('Record', (s) => cell('dns.question.type', s.dns.question?.type)),
+      column('Response', (s) => cell('dns.response_code', s.dns.response_code)),
       column('Answer / resolved IP', (s) => {
-        const answers = s.payload?.dns?.answers;
+        const answers = s.dns.answers;
         const values: FieldValue[] = Array.isArray(answers) && answers.length
-          ? answers.map((answer: any) => ({ field: 'payload.dns.answers.data', value: answer.data }))
-          : (s.payload?.dns?.resolved_ips ?? []).map((ip: string) => ({ field: 'payload.dns.resolved_ips', value: ip }));
+          ? answers.map((answer: any) => ({ field: 'dns.answers.data', value: answer.data }))
+          : (s.dns.resolved_ips ?? []).map((ip: string) => ({ field: 'dns.resolved_ips', value: ip }));
         return <FilterCell values={values} onFilter={onFilter} expandable />;
       }),
     ],
     network: [
-      column('Source', (s) => <FilterCell onFilter={onFilter} separator="" expandable values={[
-        { field: 'payload.source.ip', value: s.payload?.source?.ip },
-        { field: 'payload.source.port', value: s.payload?.source?.port, label: s.payload?.source?.port === undefined ? '' : `:${s.payload.source.port}` },
+      column('Local', (s) => <FilterCell onFilter={onFilter} separator="" expandable values={[
+        { field: 'local.ip', value: s.local?.ip },
+        { field: 'local.port', value: s.local?.port, label: s.local?.port === undefined ? '' : `:${s.local.port}` },
       ]} />),
-      column('Destination', (s) => <FilterCell onFilter={onFilter} separator="" expandable values={[
-        { field: 'payload.destination.ip', value: s.payload?.destination?.ip },
-        { field: 'payload.destination.port', value: s.payload?.destination?.port, label: s.payload?.destination?.port === undefined ? '' : `:${s.payload.destination.port}` },
+      column('Remote', (s) => <FilterCell onFilter={onFilter} separator="" expandable values={[
+        { field: 'remote.ip', value: s.remote?.ip },
+        { field: 'remote.port', value: s.remote?.port, label: s.remote?.port === undefined ? '' : `:${s.remote.port}` },
       ]} />),
-      column('Transport', (s) => cell('payload.network.transport', s.payload?.network?.transport)),
-      column('Direction', (s) => cell('payload.network.direction', s.payload?.network?.direction)),
-      column('Process', (s) => cell('payload.process.name', s.payload?.process?.name)),
+      column('Transport', (s) => cell('network.transport', s.network?.transport)),
+      column('Direction', (s) => cell('network.direction', s.network?.direction)),
+      column('Process', (s) => cell('process.name', s.process.name)),
     ],
     process: [
-      column('Executable', (s) => cell('payload.process.executable', s.payload?.process?.executable)),
-      column('PID', (s) => cell('payload.process.pid', s.payload?.process?.pid)),
-      column('Parent', (s) => cell('payload.process.parent.name', s.payload?.process?.parent?.name)),
-      column('User', (s) => cell('payload.process.user.name', s.payload?.process?.user?.name)),
-      column('Command', (s) => cell('payload.process.command_line', s.payload?.process?.command_line)),
+      column('Executable', (s) => cell('process.executable', s.process.executable)),
+      column('PID', (s) => cell('process.pid', s.process.pid)),
+      column('Parent', (s) => cell('process.parent.name', s.process.parent?.name)),
+      column('User', (s) => cell('process.user.name', s.process.user?.name)),
+      column('Command', (s) => cell('process.command_line', s.process.command_line)),
     ],
     file: [
-      column('Path', (s) => cell('payload.file.path', s.payload?.file?.path)),
+      column('Path', (s) => cell('file.path', s.file?.path)),
       column('Action', (s) => {
-        const action = s.payload?.fim?.action ?? s.payload?.file?.event?.action ?? s.payload?.event?.action;
-        const field = s.payload?.fim?.action !== undefined ? 'payload.fim.action'
-          : s.payload?.file?.event?.action !== undefined ? 'payload.file.event.action' : 'payload.event.action';
+        const action = s.fim?.action ?? s.file?.event?.action ?? s.event?.action;
+        const field = s.fim?.action !== undefined ? 'fim.action'
+          : s.file?.event?.action !== undefined ? 'file.event.action' : 'event.action';
         return cell(field, action);
       }),
-      column('Owner', (s) => cell('payload.file.owner', s.payload?.file?.owner)),
-      column('Mode', (s) => cell('payload.file.mode', s.payload?.file?.mode)),
+      column('Owner', (s) => cell('file.owner', s.file?.owner)),
+      column('Mode', (s) => cell('file.mode', s.file?.mode)),
     ],
   };
   return [...common, ...specific[module], {

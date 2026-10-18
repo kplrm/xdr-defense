@@ -60,21 +60,21 @@ test('time, module and compiled Discover filters scope every search', async () =
     } } };
     return { body: { hits: { total: { value: 2 }, hits: [{
       _id: 'agent:event', _index: '.ds-xdr-agent-telemetry-000001',
-      _score: null, sort: [1790625600000, 'event'], _ignored: ['payload.large'],
+      _score: null, sort: [1790625600000, 'event'], _ignored: ['large'],
       fields: { 'host.hostname': ['laptop'] },
       _source: { id: 'event', 'event.type': 'dns.query', 'event.module': 'telemetry.dns',
-        '@timestamp': base.from, payload: { dns: { question: { name: 'example.org' } } } },
+        '@timestamp': base.from, dns: { question: { name: 'example.org' } } },
     }] } } };
   } };
   const context = { core: { opensearch: { client: { asCurrentUser: client } } } };
   const result = await search(base, context);
   assert.equal(result.status, 200);
   assert.equal(result.body.total, 2);
-  assert.equal(result.body.events[0].source.payload.dns.question.name, 'example.org');
+  assert.equal(result.body.events[0].source.dns.question.name, 'example.org');
   // Keep metadata available to both inspection views without altering _source.
   assert.deepEqual(result.body.events[0].metadata, {
     _id: 'agent:event', _index: '.ds-xdr-agent-telemetry-000001',
-    _score: null, sort: [1790625600000, 'event'], _ignored: ['payload.large'],
+    _score: null, sort: [1790625600000, 'event'], _ignored: ['large'],
     fields: { 'host.hostname': ['laptop'] },
   });
   assert.equal(result.body.events[0].source.id, 'event');
@@ -88,7 +88,7 @@ test('time, module and compiled Discover filters scope every search', async () =
     assert.deepEqual(filters[2], base.query);
   }
   assert.equal(calls[1].body.from, 25);
-  assert.equal(calls[0].body.aggs.by_entity.terms.field, 'payload.dns.question.name');
+  assert.equal(calls[0].body.aggs.by_entity.terms.field, 'dns.question.name');
   assert.equal(calls[1].body.track_total_hits, true);
   assert.equal(calls[1].body.sort[1].id.unmapped_type, 'keyword');
 });
@@ -107,4 +107,17 @@ test('invalid scope and time are rejected; a scoped client is required', async (
     }
   }
   assert.equal((await search()).status, 503);
+});
+
+test('network summaries and filters use the remote host endpoint', async () => {
+  const calls = [];
+  const client = { search: async (params) => { calls.push(params); return { body: {} }; } };
+  const query = { term: { 'local.ip': '2001:db8::1' } };
+  const result = await search({ ...base, module: 'network', query }, {
+    core: { opensearch: { client: { asCurrentUser: client } } },
+  });
+  assert.equal(result.status, 200);
+  assert.equal(calls[0].body.aggs.by_entity.terms.field, 'remote.ip');
+  assert.equal(calls[0].body.aggs.unique_entities.cardinality.field, 'remote.ip');
+  for (const call of calls) assert.deepEqual(call.body.query.bool.filter[2], query);
 });

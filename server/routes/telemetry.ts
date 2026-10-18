@@ -71,8 +71,8 @@ export function registerTelemetryRoutes(router: any): void {
             unique_entities: { cardinality: { field: config.entityField } },
             unique_hosts: { cardinality: { field: 'host.hostname' } },
             highlight: { filter: module === 'dns'
-              ? { bool: { filter: [{ exists: { field: 'payload.dns.response_code' } }], must_not: [{ term: { 'payload.dns.response_code': 'NOERROR' } }] } }
-              : module === 'network' ? { term: { 'payload.network.direction': 'outbound' } }
+              ? { bool: { filter: [{ exists: { field: 'dns.response_code' } }], must_not: [{ term: { 'dns.response_code': 'NOERROR' } }] } }
+              : module === 'network' ? { term: { 'network.direction': 'outbound' } }
               : { term: { 'event.type': module === 'process' ? 'process.start' : 'file.access' } } },
           },
         } }),

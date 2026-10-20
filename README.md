@@ -19,9 +19,15 @@ npm run build -- --opensearch-dashboards-version 3.8.0
 
 Restart Dashboards and open `/app/xdrDefense`. For this workspace's Docker deployment, see [the local stack guide](../opensearch/README.md).
 
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development, validation, and reporting guidelines.
+
 ## License
 
-XDR Defense is free software under [GNU AGPLv3](LICENSE), which requires sharing source code when distributed or when modified versions serve remote users.
+Copyright (C) 2026 Diego A. Guillen-Rosaperez
+
+XDR Defense is free software under [GNU AGPLv3 only](LICENSE) (`AGPL-3.0`), which requires sharing source code when distributed or when modified versions serve remote users.
 
 - **Usage:** use, modify, redistribute, and sell it, including cloud hosting, while following the license.
 - **Distribution:** share the complete source code with recipients, including your changes and build files, using a method permitted by AGPLv3.

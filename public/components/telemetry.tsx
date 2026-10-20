@@ -112,7 +112,7 @@ function eventColumns(module: TelemetryModule, onFilter: AddFilter, inspect: (ev
       ]} />),
       column('Transport', (s) => cell('network.transport', s.network?.transport)),
       column('Direction', (s) => cell('network.direction', s.network?.direction)),
-      column('Process', (s) => cell('process.name', s.process.name)),
+      column('Process', (s) => cell('process.name', s.process?.name)),
     ],
     process: [
       column('Executable', (s) => cell('process.executable', s.process.executable)),

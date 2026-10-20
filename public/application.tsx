@@ -62,7 +62,7 @@ const XdrDefenseApp = ({ http, data }: { http: CoreStart['http']; data: DataPubl
         </EuiTab>)}
       </EuiTabs>
       <EuiSpacer size="m" />
-      <TelemetryExplorer http={http} data={data} dataView={dataView} module={tab}
+      <TelemetryExplorer key={tab} http={http} data={data} dataView={dataView} module={tab}
         revision={revision} onFilter={addFilter} />
     </>}
   </div>;

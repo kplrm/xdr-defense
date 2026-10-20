@@ -123,3 +123,99 @@ test('network summaries and filters use the remote host endpoint', async () => {
   assert.equal(calls[0].body.aggs.unique_entities.cardinality.field, 'remote.ip');
   for (const call of calls) assert.deepEqual(call.body.query.bool.filter[2], query);
 });
+
+test('telemetry tabs render their own events, including network events without process attribution', async () => {
+  const React = require(path.join(osdRoot, 'node_modules/react'));
+  const renderer = require(path.join(osdRoot, 'node_modules/react-test-renderer'));
+  const { Module } = require('node:module');
+  // Keep EUI lightweight while exercising the actual table column renderers.
+  const eui = new Proxy({
+    EuiBasicTable: ({ items, columns }) => React.createElement('table', null,
+      items.flatMap((item, row) => columns.map((column, cell) => React.createElement('td', {
+        key: `${row}-${cell}`,
+      }, column.render ? column.render(item[column.field], item) : item[column.field])))),
+  }, {
+    get: (components, name) => components[name] ?? (components[name] = (props) =>
+      React.createElement(name, props, props.children)),
+  });
+  function loadComponent(relative, mocks) {
+    const filename = path.join(__dirname, '..', relative);
+    const loaded = new Module(filename, module);
+    loaded.filename = filename;
+    loaded.paths = Module._nodeModulePaths(path.dirname(filename));
+    loaded.require = (name) => Object.hasOwn(mocks, name)
+      ? mocks[name] : Module.prototype.require.call(loaded, name);
+    loaded._compile(ts.transpileModule(readFileSync(filename, 'utf8'), {
+      compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020,
+        jsx: ts.JsxEmit.React, esModuleInterop: true },
+    }).outputText, filename);
+    return loaded.exports;
+  }
+  let view;
+  const explorer = loadComponent('public/components/telemetry.tsx', {
+    react: React, '@elastic/eui': eui, './telemetry.scss': {},
+  });
+  const app = loadComponent('public/application.tsx', {
+    react: React, '@elastic/eui': eui, './components/telemetry': explorer,
+    '@osd/i18n/react': { I18nProvider: React.Fragment },
+    'react-dom': {
+      render: (element) => { view = renderer.create(element); },
+      unmountComponentAtNode: () => view.unmount(),
+    },
+  });
+  const requests = [];
+  const http = { post: (_route, { body }) => new Promise((resolve) => {
+    requests.push({ module: JSON.parse(body).module, resolve });
+  }) };
+  const subscription = { subscribe: () => ({ unsubscribe() {} }) };
+  const data = {
+    dataViews: { create: async () => ({ id: 'telemetry' }) },
+    ui: { SearchBar: () => null },
+    query: {
+      state$: subscription,
+      queryString: { getQuery: () => ({ language: 'kuery', query: '' }) },
+      getOpenSearchQuery: () => ({ match_all: {} }),
+      timefilter: { timefilter: {
+        getTime: () => ({ from: base.from, to: base.to }),
+        getAutoRefreshFetch$: () => subscription,
+      } },
+    },
+  };
+  const fixtures = {
+    dns: { dns: { question: { name: 'example.org' } } },
+    network: { local: { ip: '192.0.2.1' }, remote: { ip: '198.51.100.1' } },
+    process: { process: { name: 'example', executable: '/usr/bin/example', pid: 42 } },
+    file: { file: { path: '/tmp/example' } },
+  };
+  let unmount;
+  try {
+    await renderer.act(async () => { unmount = app.renderApp({ http }, data, { element: {} }); });
+    for (const [index, activeModule] of ['dns', 'network', 'process', 'file', 'dns'].entries()) {
+      if (index) {
+        const label = activeModule === 'dns' ? 'DNS'
+          : activeModule[0].toUpperCase() + activeModule.slice(1);
+        await renderer.act(async () => {
+          view.root.findAllByType('EuiTab').find((tab) => tab.props.children === label).props.onClick();
+        });
+      }
+      assert.equal(requests.length, index + 1);
+      const request = requests[index];
+      assert.equal(request.module, activeModule);
+      await renderer.act(async () => request.resolve({
+        total: 1, page: 1, pageSize: 25, uniqueEntities: 1, uniqueHosts: 1, highlightCount: 0,
+        timeline: [], byType: [], byEntity: [], byHost: [], byFacet: [],
+        events: [{ id: activeModule, index: 'telemetry', metadata: {}, source: {
+          '@timestamp': base.from, 'event.module': `telemetry.${activeModule}`,
+          'event.type': `${activeModule}.example`, ...fixtures[activeModule],
+        } }],
+      }));
+      const displayed = JSON.stringify(view.toJSON(), (key, value) => key === 'props' ? undefined : value);
+      assert.ok(displayed.includes(`${activeModule}.example`));
+      for (const other of Object.keys(fixtures).filter((name) => name !== activeModule)) {
+        assert.ok(!displayed.includes(`${other}.example`));
+      }
+    }
+  } finally {
+    await renderer.act(async () => { if (unmount) unmount(); });
+  }
+});

@@ -2,7 +2,7 @@
 // backing index after rollover. OpenSearch uses the same search API for streams.
 export const TELEMETRY_STREAM = 'xdr-agent-telemetry';
 
-export type TelemetryModule = 'dns' | 'network' | 'process' | 'file';
+export type TelemetryModule = 'dns' | 'network' | 'process' | 'file' | 'authentication';
 
 export interface TelemetryBucket { key: string; count: number; }
 export interface TelemetryPoint extends TelemetryBucket { time: string; }
@@ -60,5 +60,10 @@ export const TELEMETRY_MODULES: Record<TelemetryModule, {
     label: 'File', modules: ['telemetry.file'], entityField: 'file.path',
     entityLabel: 'File paths', facetField: 'file.directory',
     facetLabel: 'Directories',
+  },
+  authentication: {
+    label: 'Authentication', modules: ['telemetry.authentication'], entityField: 'user.name',
+    entityLabel: 'Users', facetField: 'xdr.authentication.method',
+    facetLabel: 'Authentication methods',
   },
 };

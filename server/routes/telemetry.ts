@@ -64,7 +64,7 @@ export function registerTelemetryRoutes(router: any): void {
           aggs: {
             timeline: { date_histogram: { field: '@timestamp', fixed_interval: intervalFor(end.valueOf() - start.valueOf()), min_doc_count: 0,
               extended_bounds: { min: startIso, max: endIso } } },
-            by_type: { terms: { field: 'event.type', size: 12 } },
+            by_type: { terms: { field: module === 'authentication' ? 'event.action' : 'event.type', size: 12 } },
             by_entity: { terms: { field: config.entityField, size: 8 } },
             by_host: { terms: { field: 'host.hostname', size: 8 } },
             by_facet: { terms: { field: config.facetField, size: 8 } },
@@ -73,6 +73,9 @@ export function registerTelemetryRoutes(router: any): void {
             highlight: { filter: module === 'dns'
               ? { bool: { filter: [{ exists: { field: 'dns.response_code' } }], must_not: [{ term: { 'dns.response_code': 'NOERROR' } }] } }
               : module === 'network' ? { term: { 'network.direction': 'outbound' } }
+              : module === 'authentication' ? { bool: { filter: [
+                { term: { 'event.action': 'authentication-failure' } }, { term: { 'event.outcome': 'failure' } },
+              ] } }
               : { term: { 'event.type': module === 'process' ? 'process.start' : 'file.access' } } },
           },
         } }),

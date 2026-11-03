@@ -7,7 +7,7 @@ import { DataPublicPluginStart, DataView } from '../../OpenSearch-Dashboards/src
 import { TELEMETRY_MODULES, TELEMETRY_STREAM, TelemetryModule } from '../common/telemetry';
 import { TelemetryExplorer } from './components/telemetry';
 
-const modules: TelemetryModule[] = ['dns', 'network', 'process', 'file'];
+const modules = Object.keys(TELEMETRY_MODULES) as TelemetryModule[];
 
 const XdrDefenseApp = ({ http, data }: { http: CoreStart['http']; data: DataPublicPluginStart }) => {
   const [tab, setTab] = useState<TelemetryModule>('dns');
@@ -47,7 +47,7 @@ const XdrDefenseApp = ({ http, data }: { http: CoreStart['http']; data: DataPubl
   const SearchBar = data.ui.SearchBar;
   return <div style={{ maxWidth: 1600, margin: '0 auto', padding: 24 }}>
     <EuiTitle size="l"><h1>XDR Defense</h1></EuiTitle>
-    <EuiText size="s" color="subdued">Explore endpoint DNS, network, process and file telemetry.</EuiText>
+    <EuiText size="s" color="subdued">Explore endpoint DNS, network, process, file and authentication telemetry.</EuiText>
     <EuiSpacer size="m" />
     {viewError && <><EuiCallOut title={viewError} color="danger" /><EuiSpacer /></>}
     {!dataView && !viewError && <EuiLoadingSpinner />}

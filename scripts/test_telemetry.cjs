@@ -124,6 +124,26 @@ test('network summaries and filters use the remote host endpoint', async () => {
   for (const call of calls) assert.deepEqual(call.body.query.bool.filter[2], query);
 });
 
+test('authentication summaries scope users, methods and failed authentication records', async () => {
+  const calls = [];
+  const client = { search: async (params) => { calls.push(params); return { body: {} }; } };
+  const query = { term: { 'event.outcome': 'failure' } };
+  const result = await search({ ...base, module: 'authentication', query }, {
+    core: { opensearch: { client: { asCurrentUser: client } } },
+  });
+  assert.equal(result.status, 200);
+  for (const call of calls) {
+    assert.deepEqual(call.body.query.bool.filter[1], { terms: { 'event.module': ['telemetry.authentication'] } });
+    assert.deepEqual(call.body.query.bool.filter[2], query);
+  }
+  assert.equal(calls[0].body.aggs.by_entity.terms.field, 'user.name');
+  assert.equal(calls[0].body.aggs.by_type.terms.field, 'event.action');
+  assert.equal(calls[0].body.aggs.by_facet.terms.field, 'xdr.authentication.method');
+  assert.deepEqual(calls[0].body.aggs.highlight.filter, { bool: { filter: [
+    { term: { 'event.action': 'authentication-failure' } }, { term: { 'event.outcome': 'failure' } },
+  ] } });
+});
+
 test('telemetry tabs render their own events, including network events without process attribution', async () => {
   const React = require(path.join(osdRoot, 'node_modules/react'));
   const renderer = require(path.join(osdRoot, 'node_modules/react-test-renderer'));
@@ -186,11 +206,14 @@ test('telemetry tabs render their own events, including network events without p
     network: { local: { ip: '192.0.2.1' }, remote: { ip: '198.51.100.1' } },
     process: { process: { name: 'example', executable: '/usr/bin/example', pid: 42 } },
     file: { file: { path: '/tmp/example' } },
+    authentication: { 'event.action': 'authentication.example', 'event.outcome': 'success',
+      user: { name: 'alice' }, source: { address: '192.0.2.1', ip: '192.0.2.1', port: 22 },
+      service: { name: 'sshd' }, xdr: { authentication: { method: 'publickey', key: { fingerprint: 'SHA256:example' } } } },
   };
   let unmount;
   try {
     await renderer.act(async () => { unmount = app.renderApp({ http }, data, { element: {} }); });
-    for (const [index, activeModule] of ['dns', 'network', 'process', 'file', 'dns'].entries()) {
+    for (const [index, activeModule] of ['dns', 'network', 'process', 'file', 'authentication', 'dns'].entries()) {
       if (index) {
         const label = activeModule === 'dns' ? 'DNS'
           : activeModule[0].toUpperCase() + activeModule.slice(1);
@@ -211,6 +234,23 @@ test('telemetry tabs render their own events, including network events without p
       }));
       const displayed = JSON.stringify(view.toJSON(), (key, value) => key === 'props' ? undefined : value);
       assert.ok(displayed.includes(`${activeModule}.example`));
+      if (activeModule === 'authentication') {
+        for (const value of ['alice', 'publickey', 'SHA256:example', '192.0.2.1', 'success', 'sshd']) {
+          assert.ok(displayed.includes(value), `Missing authentication column value ${value}`);
+        }
+        // Authentication table values use the same native filter pills as other tabs.
+        const userLink = view.root.findAllByType('EuiLink').find((link) => link.props.children === 'alice');
+        let filters;
+        data.query.filterManager = { addFilters: (value) => { filters = value; } };
+        await renderer.act(async () => userLink.props.onClick());
+        assert.deepEqual(filters[0].query, { match_phrase: { 'user.name': 'alice' } });
+        // Preserve both inspection views and the complete source document.
+        const detailsButton = view.root.findAllByType('EuiButtonEmpty').find((button) => button.props.children === 'View event');
+        await renderer.act(async () => detailsButton.props.onClick());
+        await renderer.act(async () => view.root.findAllByType('EuiTab').find((tab) => tab.props.children === 'JSON').props.onClick());
+        const document = JSON.parse(view.root.findByType('EuiCodeBlock').props.children);
+        assert.equal(document._source.xdr.authentication.key.fingerprint, 'SHA256:example');
+      }
       for (const other of Object.keys(fixtures).filter((name) => name !== activeModule)) {
         assert.ok(!displayed.includes(`${other}.example`));
       }

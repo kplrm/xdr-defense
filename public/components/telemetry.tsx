@@ -85,7 +85,9 @@ function eventColumns(module: TelemetryModule, onFilter: AddFilter, inspect: (ev
   });
   const common: Array<EuiBasicTableColumn<TelemetryEvent>> = [
     column('Time', (s) => cell('@timestamp', s['@timestamp'], timestamp(s['@timestamp']))),
-    column('Event type', (s) => cell('event.type', s['event.type'])),
+    module === 'authentication'
+      ? column('Action', (s) => cell('event.action', s['event.action']))
+      : column('Event type', (s) => cell('event.type', s['event.type'])),
     column('Host', (s) => cell('host.hostname', s['host.hostname'])),
   ];
   const specific: Record<TelemetryModule, Array<EuiBasicTableColumn<TelemetryEvent>>> = {
@@ -131,6 +133,20 @@ function eventColumns(module: TelemetryModule, onFilter: AddFilter, inspect: (ev
       }),
       column('Owner', (s) => cell('file.owner', s.file?.owner)),
       column('Mode', (s) => cell('file.mode', s.file?.mode)),
+    ],
+    authentication: [
+      column('User / effective user', (s) => <FilterCell onFilter={onFilter} separator=" → " expandable values={[
+        { field: 'user.name', value: s.user?.name },
+        { field: 'user.effective.name', value: s.user?.effective?.name },
+      ]} />),
+      column('Method', (s) => cell('xdr.authentication.method', s.xdr?.authentication?.method)),
+      column('Outcome', (s) => cell('event.outcome', s['event.outcome'])),
+      column('Source', (s) => <FilterCell onFilter={onFilter} separator="" expandable values={[
+        { field: 'source.address', value: s.source?.address },
+        { field: 'source.port', value: s.source?.port, label: s.source?.port === undefined ? '' : `:${s.source.port}` },
+      ]} />),
+      column('Key fingerprint', (s) => cell('xdr.authentication.key.fingerprint', s.xdr?.authentication?.key?.fingerprint)),
+      column('Service', (s) => cell('service.name', s.service?.name)),
     ],
   };
   return [...common, ...specific[module], {
@@ -199,7 +215,7 @@ export const TelemetryExplorer = ({ http, data: dataPlugin, dataView, module, re
   const [selected, setSelected] = useState<TelemetryEvent>();
   const config = TELEMETRY_MODULES[module];
   const highlightLabel = { dns: 'Failed DNS answers', network: 'Outbound events',
-    process: 'Process starts', file: 'File accesses' }[module];
+    process: 'Process starts', file: 'File accesses', authentication: 'Failed authentication records' }[module];
 
   useEffect(() => { setPage(0); setSelected(undefined); }, [module, revision]);
 
@@ -245,7 +261,8 @@ export const TelemetryExplorer = ({ http, data: dataPlugin, dataView, module, re
       </EuiPanel>
       <EuiSpacer />
       <EuiFlexGroup wrap>
-        <EuiFlexItem><Breakdown title="Event types" field="event.type" items={response.byType} onFilter={onFilter} /></EuiFlexItem>
+        <EuiFlexItem><Breakdown title={module === 'authentication' ? 'Actions' : 'Event types'}
+          field={module === 'authentication' ? 'event.action' : 'event.type'} items={response.byType} onFilter={onFilter} /></EuiFlexItem>
         <EuiFlexItem><Breakdown title={`Top ${config.entityLabel.toLowerCase()}`} field={config.entityField} items={response.byEntity} onFilter={onFilter} /></EuiFlexItem>
         <EuiFlexItem><Breakdown title={config.facetLabel} field={config.facetField} items={response.byFacet} onFilter={onFilter} /></EuiFlexItem>
       </EuiFlexGroup>

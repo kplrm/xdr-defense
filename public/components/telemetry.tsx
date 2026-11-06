@@ -7,6 +7,7 @@ import {
 import { CoreStart } from '../../../OpenSearch-Dashboards/src/core/public';
 import { DataPublicPluginStart, DataView } from '../../../OpenSearch-Dashboards/src/plugins/data/public';
 import { TELEMETRY_MODULES, TelemetryBucket, TelemetryEvent, TelemetryModule, TelemetryResponse } from '../../common/telemetry';
+import { formatTimestamp as timestamp } from './timestamp';
 import './telemetry.scss';
 
 type FilterValue = string | number | boolean;
@@ -17,7 +18,6 @@ interface Props {
 }
 interface FieldValue { field: string; value: FilterValue | null | undefined; label?: string; filterable?: boolean; }
 const display = (value: unknown): string => value === undefined || value === null || value === '' ? '—' : String(value);
-const timestamp = (value: string) => value ? new Date(value).toLocaleString() : '—';
 const visible = (value: unknown) => value !== undefined && value !== null && value !== '';
 
 function FilterCell({ values, onFilter, separator = ', ', expandable = false }: {

@@ -40,6 +40,34 @@ async function search(body = base, context = {}) {
   return route.handler(context, { body: route.config.validate.body.validate(body) }, response);
 }
 
+test('timestamps retain original fractional precision and browser locale/time zone', () => {
+  let locale, timeZone;
+  const compiled = ts.transpileModule(readFileSync(path.join(__dirname, '../public/components/timestamp.ts'), 'utf8'), {
+    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 },
+  }).outputText;
+  const { formatTimestamp } = require('node:vm').runInNewContext(`${compiled}\nexports;`, {
+    exports: {},
+    Intl: {
+      DateTimeFormat: (requestedLocale, options) => Intl.DateTimeFormat(requestedLocale ?? locale, { timeZone, ...options }),
+      NumberFormat: (requestedLocale, options) => Intl.NumberFormat(requestedLocale ?? locale, options),
+    },
+  });
+  for (const sample of [
+    ['en-US', 'Europe/Berlin', '2026-11-06T22:32:09.685940773Z', '11/6/2026, 11:32:09.685940773 PM'],
+    ['fr-FR', 'Europe/Paris', '2026-11-06T22:32:09.685940773Z', '06/11/2026 23:32:09,685940773'],
+    ['en-US', 'America/New_York', '2026-11-06T22:32:09.000001200Z', '11/6/2026, 5:32:09.000001200 PM'],
+    ['en-US', 'Asia/Kolkata', '2026-11-06T22:32:09.1Z', '11/7/2026, 4:02:09.1 AM'],
+    ['en-US', 'Europe/Berlin', '2026-07-01T22:32:09Z', '7/2/2026, 12:32:09 AM'],
+  ]) {
+    [locale, timeZone] = sample;
+    // ICU may use a narrow no-break space before AM/PM.
+    assert.equal(formatTimestamp(sample[2]).replace(/\s/g, ''), sample[3].replace(/\s/g, ''));
+  }
+  assert.equal(formatTimestamp('invalid'), '—');
+  assert.equal(formatTimestamp(''), '—');
+  assert.equal(formatTimestamp(), '—');
+});
+
 test('only the documented read-only telemetry search route remains', () => {
   assert.deepEqual([...routes.keys()], [routePath]);
   const doc = readFileSync(path.join(__dirname, '../README.md'), 'utf8');
@@ -201,12 +229,13 @@ test('telemetry tabs render their own events, including network events without p
       } },
     },
   };
+  const preciseTime = '2026-11-06T22:32:09.685940773Z';
   const fixtures = {
     dns: { dns: { question: { name: 'example.org' } } },
     network: { local: { ip: '192.0.2.1' }, remote: { ip: '198.51.100.1' } },
     process: { process: { name: 'example', executable: '/usr/bin/example', pid: 42 } },
     file: { file: { path: '/tmp/example' } },
-    authentication: { 'event.action': 'authentication.example', 'event.outcome': 'success',
+    authentication: { '@timestamp': preciseTime, 'event.action': 'authentication.example', 'event.outcome': 'success',
       user: { name: 'alice' }, source: { address: '192.0.2.1', ip: '192.0.2.1', port: 22 },
       service: { name: 'sshd' }, xdr: { authentication: { method: 'publickey', key: { fingerprint: 'SHA256:example' } } } },
   };
@@ -242,6 +271,10 @@ test('telemetry tabs render their own events, including network events without p
         const userLink = view.root.findAllByType('EuiLink').find((link) => link.props.children === 'alice');
         let filters;
         data.query.filterManager = { addFilters: (value) => { filters = value; } };
+        const timeLink = view.root.findAllByType('EuiLink').find((link) => link.props.title === `Filter: @timestamp is ${preciseTime}`);
+        assert.ok(timeLink.props.children.includes('685940773'), 'Time column must retain every fractional digit');
+        await renderer.act(async () => timeLink.props.onClick());
+        assert.deepEqual(filters[0].query, { match_phrase: { '@timestamp': preciseTime } });
         await renderer.act(async () => userLink.props.onClick());
         assert.deepEqual(filters[0].query, { match_phrase: { 'user.name': 'alice' } });
         // Preserve both inspection views and the complete source document.
